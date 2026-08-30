@@ -583,7 +583,7 @@ When adding a new migration:
 1. Create `migrations/NNN_description.sql` with the DDL.
 2. **CRITICAL: Register it in `src/db.rs`** in the `migrations` array inside `migrate()`. Forgetting this step means the migration never runs on existing deployments, and any queries referencing the new table/column will fail silently (due to `unwrap_or_default()`). This has caused production bugs before — always verify the migration is registered.
 
-### Localization (Fluent + Weblate)
+### Localization (Fluent)
 
 calrs ships with translations for English, French, Spanish, Polish, German, Italian, Estonian and Brazilian Portuguese. Source files live under `i18n/{lang}/main.ftl` and are embedded in the binary via `include_str!` (no runtime files). The loader, language detection, and minijinja `t()` global are in `src/i18n.rs`. Templates use `{{ t("message-id", arg=value) }}` and the active language is injected into the rendering context as `lang` by the calling handler.
 
@@ -605,24 +605,26 @@ All locales address the reader informally, matching what the earliest translatio
 
 **Literal braces in a Fluent value** must be escaped as `{"{"}`: a bare `{` starts a placeable. This bites the meeting-pattern help, which documents `{username}` and `{random}` tokens.
 
-**Branch workflow (long-lived `i18n` branch).** The `i18n` branch is permanent. **Do not delete it after merging.** Translators commit through Hosted Weblate, which pushes to `i18n` via the Weblate GitHub App. Periodically (e.g. before each release) merge `i18n` into `main`, then continue using the same branch for the next round of translations. The branch never gets recreated.
+**Branch workflow (long-lived `i18n` branch).** The `i18n` branch is permanent. **Do not delete it after merging.** Translation contributions arrive as pull requests against it. Periodically (e.g. before each release) merge `i18n` into `main`, then continue using the same branch for the next round. The branch never gets recreated, and it normally sits exactly at `main`, so a round never starts stale.
+
+**There is no translation platform.** A Hosted Weblate project was applied for and never approved, so the account was closed and the links 404ed for months while the README still advertised them (#200). No commit in this repository's history was ever authored by Weblate. Every community translation calrs has received came in as an ordinary pull request. Do not reintroduce a platform reference without a working project behind it.
 
 **When you add or change a translatable string:**
-1. Land it on the `i18n` branch first, not `main`. This avoids half-translated UI on `main` and gives Weblate translators time to catch up before the next merge.
+1. Land it on the `i18n` branch first, not `main`. This keeps half-translated UI off `main` and gives contributors a window before the next merge.
 2. Add the new key to `i18n/en/main.ftl` (the source of truth), then to every other locale. The runtime still falls back to English per missing key, but the coverage test does not let you rely on it.
 3. If the change touches a template that wasn't translated yet, convert its hard-coded strings to `{{ t("...") }}` calls in the same commit, and add render-site context entries (`lang => crate::i18n::detect_from_headers(&headers)` for guest pages, `lang => auth_user.lang` for authenticated dashboard pages).
 4. Run `cargo test i18n::` before pushing: it checks coverage across all eight locales and the plural categories each language needs.
 
-**Adding a key now costs eight translations, not one.** The coverage test fails until every locale has a value. That is deliberate: a half-translated page is worse than an English one because nobody notices it is wrong. If you cannot supply all eight, land the key on `i18n` and let Weblate fill the rest before merging to `main`.
+**Adding a key now costs eight translations, not one.** The coverage test fails until every locale has a value. That is deliberate: a half-translated page is worse than an English one because nobody notices it is wrong. If you cannot supply all eight, land the key on `i18n` and leave it there until someone can.
 
-**When you add a new locale:**
-1. Create `i18n/{code}/main.ftl` (start empty, runtime falls back to English).
-2. Register it in `SUPPORTED_LANGS` in `src/i18n.rs`.
-3. Add a label to `supported_with_labels()` so it appears in the settings dropdown.
-4. Push to `i18n`. Weblate auto-detects the new language file on next pull.
+**When you add a new locale**, in this order:
+1. Create `i18n/{code}/main.ftl` and translate every key. **Not empty**: the moment the locale is registered, `every_locale_covers_every_english_key` demands all of them, so an empty file fails with over a thousand errors.
+2. Register it in `SUPPORTED_LANGS` in `src/i18n.rs`: code, the language's own name for itself, `include_str!`. `supported_with_labels()` derives the settings dropdown from this tuple, so there is no second place to edit.
+3. Add the locale's CLDR plural categories to the `required` table in `plural_messages_carry_the_locale_categories`. Most need `one, other`; Polish needs `one, few, many`.
+4. `cargo test i18n::`, then push to `i18n`.
 
 **Anti-patterns to avoid:**
-- Don't bypass `t()` and inline new English strings directly in templates that are already translated. Translators will silently drift out of date.
+- Don't bypass `t()` and inline new English strings directly in templates that are already translated. The other locales silently drift out of date.
 - Don't merge `main` into `i18n` to "sync"; the flow goes `i18n → main`. New features that touch UI text should branch off `i18n`, not `main`.
 
 ### Updating the GitHub Pages site
