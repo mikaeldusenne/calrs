@@ -2957,17 +2957,17 @@ async fn settings_page(
             .fetch_one(&state.pool)
             .await
             .unwrap_or(0);
+    let values = SettingsValues::from_user(&auth_user.user, &avail, lend_resource_write != 0);
     settings_render(
         &state,
         &auth_user.user,
+        &values,
         auth_user.lang,
         None,
         None,
         sidebar,
         impersonating,
         &impersonating_name,
-        &avail,
-        lend_resource_write != 0,
     )
 }
 
@@ -3185,17 +3185,57 @@ async fn dashboard_availability_default(
     axum::Json(serde_json::json!({ "schedule": schedule }))
 }
 
+/// The editable half of the settings form, as it should be rendered back.
+///
+/// The GET and the success path fill this from the stored row; the error paths
+/// fill it from what was just submitted, so a rejected field does not discard
+/// the rest of the edits (#206).
+struct SettingsValues<'a> {
+    name: &'a str,
+    username: &'a str,
+    title: &'a str,
+    bio: &'a str,
+    booking_email: &'a str,
+    timezone: &'a str,
+    language: &'a str,
+    allow_dynamic_group: bool,
+    lend_resource_write: bool,
+    avail_schedule: &'a str,
+}
+
+impl<'a> SettingsValues<'a> {
+    /// The availability schedule and `lend_resource_write` are not on the user
+    /// row, so they are passed in.
+    fn from_user(
+        user: &'a crate::models::User,
+        avail_schedule: &'a str,
+        lend_resource_write: bool,
+    ) -> Self {
+        Self {
+            name: &user.name,
+            username: user.username.as_deref().unwrap_or(""),
+            title: user.title.as_deref().unwrap_or(""),
+            bio: user.bio.as_deref().unwrap_or(""),
+            booking_email: user.booking_email.as_deref().unwrap_or(""),
+            timezone: &user.timezone,
+            language: user.language.as_deref().unwrap_or(""),
+            allow_dynamic_group: user.allow_dynamic_group,
+            lend_resource_write,
+            avail_schedule,
+        }
+    }
+}
+
 fn settings_render(
     state: &AppState,
     user: &crate::models::User,
+    values: &SettingsValues<'_>,
     lang: &str,
     success: Option<&str>,
     error: Option<&str>,
     sidebar: minijinja::Value,
     impersonating: bool,
     impersonating_name: &str,
-    avail_schedule: &str,
-    lend_resource_write: bool,
 ) -> Html<String> {
     let tmpl = match state.templates.get_template("settings.html") {
         Ok(t) => t,
@@ -3214,22 +3254,29 @@ fn settings_render(
         tmpl.render(context! {
             lang => lang,
             sidebar => sidebar,
-            form_name => user.name,
-            form_initials => compute_initials(&user.name),
-            form_title => user.title.as_deref().unwrap_or(""),
-            form_bio => user.bio.as_deref().unwrap_or(""),
-            form_booking_email => user.booking_email.as_deref().unwrap_or(""),
-            form_timezone => user.timezone,
+            form_name => values.name,
+            // Follows the name being shown, so an edited name updates the
+            // avatar preview too. A rejected empty name falls back to the
+            // stored one rather than rendering the "?" placeholder.
+            form_initials => compute_initials(if values.name.trim().is_empty() {
+                &user.name
+            } else {
+                values.name
+            }),
+            form_title => values.title,
+            form_bio => values.bio,
+            form_booking_email => values.booking_email,
+            form_timezone => values.timezone,
             tz_options => tz_options,
-            form_language => user.language.as_deref().unwrap_or(""),
+            form_language => values.language,
             lang_options => lang_options,
             user_email => user.email,
             user_id => user.id,
             has_avatar => user.avatar_path.is_some(),
-            username => user.username.as_deref().unwrap_or(""),
-            allow_dynamic_group => user.allow_dynamic_group,
-            lend_resource_write => lend_resource_write,
-            form_avail_schedule => avail_schedule,
+            username => values.username,
+            allow_dynamic_group => values.allow_dynamic_group,
+            lend_resource_write => values.lend_resource_write,
+            form_avail_schedule => values.avail_schedule,
             success => success.unwrap_or(""),
             error => error.unwrap_or(""),
             impersonating => impersonating,
@@ -3253,27 +3300,6 @@ async fn settings_save(
     let sidebar = sidebar_context(&auth_user, "settings");
     let (imp, imp_name, _) = impersonation_ctx(&auth_user);
 
-    if name.is_empty() || name.len() > 255 {
-        return settings_render(
-            &state,
-            user,
-            auth_user.lang,
-            None,
-            Some(&crate::i18n::translate(
-                auth_user.lang,
-                "settings-error-name-length",
-                None,
-            )),
-            sidebar,
-            imp,
-            &imp_name,
-            &form.avail_schedule,
-            form.lend_resource_write.as_deref() == Some("on"),
-        )
-        .into_response();
-    }
-
-    // Validate and update username if provided
     let new_username = form
         .username
         .as_deref()
@@ -3286,62 +3312,6 @@ async fn settings_save(
                 .collect::<String>()
         })
         .filter(|s| !s.is_empty());
-
-    if let Some(ref uname) = new_username {
-        if uname.len() < 2 {
-            return settings_render(
-                &state,
-                user,
-                auth_user.lang,
-                None,
-                Some(&crate::i18n::translate(
-                    auth_user.lang,
-                    "settings-error-username-length",
-                    None,
-                )),
-                sidebar,
-                imp,
-                &imp_name,
-                &form.avail_schedule,
-                form.lend_resource_write.as_deref() == Some("on"),
-            )
-            .into_response();
-        }
-        // Check uniqueness (only if different from current)
-        if user.username.as_deref() != Some(uname.as_str()) {
-            let taken: Option<(String,)> =
-                sqlx::query_as("SELECT id FROM users WHERE username = ? AND id != ?")
-                    .bind(uname)
-                    .bind(&user.id)
-                    .fetch_optional(&state.pool)
-                    .await
-                    .unwrap_or(None);
-            if taken.is_some() {
-                return settings_render(
-                    &state,
-                    user,
-                    auth_user.lang,
-                    None,
-                    Some(&crate::i18n::translate(
-                        auth_user.lang,
-                        "settings-error-username-taken",
-                        None,
-                    )),
-                    sidebar,
-                    imp,
-                    &imp_name,
-                    &form.avail_schedule,
-                    form.lend_resource_write.as_deref() == Some("on"),
-                )
-                .into_response();
-            }
-            let _ = sqlx::query("UPDATE users SET username = ? WHERE id = ?")
-                .bind(uname)
-                .bind(&user.id)
-                .execute(&state.pool)
-                .await;
-        }
-    }
 
     let title = form
         .title
@@ -3364,34 +3334,6 @@ async fn settings_save(
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
 
-    if let Some(ref be) = booking_email {
-        if be.len() > 255
-            || !be.contains('@')
-            || be
-                .rsplit('@')
-                .next()
-                .is_none_or(|domain| !domain.contains('.'))
-        {
-            return settings_render(
-                &state,
-                user,
-                auth_user.lang,
-                None,
-                Some(&crate::i18n::translate(
-                    auth_user.lang,
-                    "settings-error-booking-email",
-                    None,
-                )),
-                sidebar,
-                imp,
-                &imp_name,
-                &form.avail_schedule,
-                form.lend_resource_write.as_deref() == Some("on"),
-            )
-            .into_response();
-        }
-    }
-
     let timezone = form
         .timezone
         .as_deref()
@@ -3411,6 +3353,90 @@ async fn settings_save(
 
     let allow_dynamic_group = form.allow_dynamic_group.as_deref() == Some("on");
     let lend_resource_write = form.lend_resource_write.as_deref() == Some("on");
+
+    // Every field is normalised before the first check, so a rejected one can be
+    // sent back alongside the others instead of the whole form reverting to the
+    // stored row. An empty username field means "keep the current one", and that
+    // is what the form shows back.
+    let submitted = SettingsValues {
+        name: &name,
+        username: new_username
+            .as_deref()
+            .or(user.username.as_deref())
+            .unwrap_or(""),
+        title: title.as_deref().unwrap_or(""),
+        bio: bio.as_deref().unwrap_or(""),
+        booking_email: booking_email.as_deref().unwrap_or(""),
+        timezone: &timezone,
+        language: language.as_deref().unwrap_or(""),
+        allow_dynamic_group,
+        lend_resource_write,
+        avail_schedule: &form.avail_schedule,
+    };
+    // The sidebar is a parameter rather than a capture, so it can be moved into
+    // whichever branch ends up rendering. An error path never saves, so it keeps
+    // the language the request came in with.
+    let render_error = |error: &str, sidebar: minijinja::Value| {
+        settings_render(
+            &state,
+            user,
+            &submitted,
+            auth_user.lang,
+            None,
+            Some(error),
+            sidebar,
+            imp,
+            &imp_name,
+        )
+        .into_response()
+    };
+
+    if name.is_empty() || name.len() > 255 {
+        let msg = crate::i18n::translate(auth_user.lang, "settings-error-name-length", None);
+        return render_error(&msg, sidebar);
+    }
+
+    // Validate and update username if provided
+    if let Some(ref uname) = new_username {
+        if uname.len() < 2 {
+            let msg =
+                crate::i18n::translate(auth_user.lang, "settings-error-username-length", None);
+            return render_error(&msg, sidebar);
+        }
+        // Check uniqueness (only if different from current)
+        if user.username.as_deref() != Some(uname.as_str()) {
+            let taken: Option<(String,)> =
+                sqlx::query_as("SELECT id FROM users WHERE username = ? AND id != ?")
+                    .bind(uname)
+                    .bind(&user.id)
+                    .fetch_optional(&state.pool)
+                    .await
+                    .unwrap_or(None);
+            if taken.is_some() {
+                let msg =
+                    crate::i18n::translate(auth_user.lang, "settings-error-username-taken", None);
+                return render_error(&msg, sidebar);
+            }
+            let _ = sqlx::query("UPDATE users SET username = ? WHERE id = ?")
+                .bind(uname)
+                .bind(&user.id)
+                .execute(&state.pool)
+                .await;
+        }
+    }
+
+    if let Some(ref be) = booking_email {
+        if be.len() > 255
+            || !be.contains('@')
+            || be
+                .rsplit('@')
+                .next()
+                .is_none_or(|domain| !domain.contains('.'))
+        {
+            let msg = crate::i18n::translate(auth_user.lang, "settings-error-booking-email", None);
+            return render_error(&msg, sidebar);
+        }
+    }
 
     let result = sqlx::query(
         "UPDATE users SET name = ?, title = ?, bio = ?, booking_email = ?, timezone = ?, language = ?, allow_dynamic_group = ?, lend_resource_write = ?, updated_at = datetime('now') WHERE id = ?",
@@ -3446,38 +3472,25 @@ async fn settings_save(
             // auth_user.lang was resolved before the UPDATE, so a language
             // change would confirm in the old language without this.
             let lang = crate::i18n::resolve(updated_user.language.as_deref(), &headers);
-            let sidebar = sidebar_context(&auth_user, "settings");
+            let saved =
+                SettingsValues::from_user(&updated_user, &form.avail_schedule, lend_resource_write);
             settings_render(
                 &state,
                 &updated_user,
+                &saved,
                 lang,
                 Some(&crate::i18n::translate(lang, "settings-saved", None)),
                 None,
                 sidebar,
                 imp,
                 &imp_name,
-                &form.avail_schedule,
-                form.lend_resource_write.as_deref() == Some("on"),
             )
             .into_response()
         }
-        Err(_) => settings_render(
-            &state,
-            user,
-            auth_user.lang,
-            None,
-            Some(&crate::i18n::translate(
-                auth_user.lang,
-                "settings-error-save-failed",
-                None,
-            )),
-            sidebar,
-            imp,
-            &imp_name,
-            &form.avail_schedule,
-            form.lend_resource_write.as_deref() == Some("on"),
-        )
-        .into_response(),
+        Err(_) => {
+            let msg = crate::i18n::translate(auth_user.lang, "settings-error-save-failed", None);
+            render_error(&msg, sidebar)
+        }
     }
 }
 
@@ -29989,6 +30002,111 @@ mod tests {
         assert!(
             !resp_body.contains("Settings saved"),
             "confirmation should not render in the pre-save language"
+        );
+    }
+
+    #[tokio::test]
+    async fn settings_validation_error_keeps_the_submitted_fields() {
+        let (app, pool, session, _) = setup_test_app().await;
+        let csrf = "test-csrf-settings-keep";
+        // Empty name is rejected. Every other field carries an edit, and none of
+        // them matches what the seeded row holds.
+        let body = format!(
+            "_csrf={}&name=&username=testuser&title=Head+of+Demos&bio=Runs+the+demo+rota\
+             &booking_email=demo%40example.com&timezone=Europe%2FParis&language=fr",
+            csrf
+        );
+        let response = app
+            .oneshot(post_form("/dashboard/settings", &session, csrf, &body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let resp_body = body_string(response).await;
+
+        assert!(
+            resp_body.contains("Name must be between 1 and 255 characters."),
+            "the name error should be shown"
+        );
+        for expected in [
+            r#"value="Head of Demos""#,
+            "Runs the demo rota",
+            r#"value="demo@example.com""#,
+            // minijinja escapes the slash in the option value.
+            r#"value="Europe&#x2f;Paris" selected"#,
+            r#"value="fr" selected"#,
+        ] {
+            assert!(
+                resp_body.contains(expected),
+                "a rejected field should not discard the other edits, missing {expected}"
+            );
+        }
+
+        // The checkbox was left unchecked, so it must come back unchecked even
+        // though the stored row still has it on.
+        let checkbox = resp_body
+            .split(r#"name="allow_dynamic_group""#)
+            .nth(1)
+            .expect("the dynamic-group checkbox should render")
+            .split('>')
+            .next()
+            .unwrap_or("");
+        assert!(
+            !checkbox.contains("checked"),
+            "an unchecked box should come back unchecked"
+        );
+
+        // Nothing was saved: the UPDATE never ran.
+        let (title, tz): (Option<String>, String) =
+            sqlx::query_as("SELECT title, timezone FROM users WHERE email = 'test@example.com'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(title, None);
+        assert_eq!(tz, "UTC");
+    }
+
+    #[tokio::test]
+    async fn settings_booking_email_error_shows_the_rejected_value() {
+        let (app, _pool, session, _) = setup_test_app().await;
+        let csrf = "test-csrf-settings-email";
+        let body = format!(
+            "_csrf={}&name=Alice+Martin&username=testuser&title=Head+of+Demos\
+             &booking_email=not-an-email",
+            csrf
+        );
+        let response = app
+            .oneshot(post_form("/dashboard/settings", &session, csrf, &body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let resp_body = body_string(response).await;
+
+        assert!(
+            resp_body.contains("Please enter a valid booking email address."),
+            "the booking email error should be shown"
+        );
+        assert!(
+            resp_body.contains(r#"value="not-an-email""#),
+            "the field in error should show the value that was rejected"
+        );
+        assert!(
+            resp_body.contains(r#"value="Head of Demos""#),
+            "the other edits should survive the error"
+        );
+        assert!(
+            resp_body.contains(r#"value="Alice Martin""#),
+            "the submitted name should survive the error"
+        );
+        let avatar = resp_body
+            .split(r#"flex-shrink: 0; overflow: hidden;">"#)
+            .nth(1)
+            .expect("the avatar preview should render")
+            .split("</div>")
+            .next()
+            .unwrap_or("");
+        assert!(
+            avatar.contains("AM"),
+            "the avatar initials should follow the name being shown, got {avatar:?}"
         );
     }
 
