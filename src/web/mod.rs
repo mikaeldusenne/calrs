@@ -3255,7 +3255,14 @@ fn settings_render(
             lang => lang,
             sidebar => sidebar,
             form_name => values.name,
-            form_initials => compute_initials(&user.name),
+            // Follows the name being shown, so an edited name updates the
+            // avatar preview too. A rejected empty name falls back to the
+            // stored one rather than rendering the "?" placeholder.
+            form_initials => compute_initials(if values.name.trim().is_empty() {
+                &user.name
+            } else {
+                values.name
+            }),
             form_title => values.title,
             form_bio => values.bio,
             form_booking_email => values.booking_email,
@@ -30063,7 +30070,8 @@ mod tests {
         let (app, _pool, session, _) = setup_test_app().await;
         let csrf = "test-csrf-settings-email";
         let body = format!(
-            "_csrf={}&name=Test+User&username=testuser&title=Head+of+Demos&booking_email=not-an-email",
+            "_csrf={}&name=Alice+Martin&username=testuser&title=Head+of+Demos\
+             &booking_email=not-an-email",
             csrf
         );
         let response = app
@@ -30084,6 +30092,21 @@ mod tests {
         assert!(
             resp_body.contains(r#"value="Head of Demos""#),
             "the other edits should survive the error"
+        );
+        assert!(
+            resp_body.contains(r#"value="Alice Martin""#),
+            "the submitted name should survive the error"
+        );
+        let avatar = resp_body
+            .split(r#"flex-shrink: 0; overflow: hidden;">"#)
+            .nth(1)
+            .expect("the avatar preview should render")
+            .split("</div>")
+            .next()
+            .unwrap_or("");
+        assert!(
+            avatar.contains("AM"),
+            "the avatar initials should follow the name being shown, got {avatar:?}"
         );
     }
 
