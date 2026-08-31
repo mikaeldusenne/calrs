@@ -3443,16 +3443,15 @@ async fn settings_save(
             let updated_user = crate::auth::get_user_by_id(&state.pool, &user.id)
                 .await
                 .unwrap_or_else(|| user.clone());
+            // auth_user.lang was resolved before the UPDATE, so a language
+            // change would confirm in the old language without this.
+            let lang = crate::i18n::resolve(updated_user.language.as_deref(), &headers);
             let sidebar = sidebar_context(&auth_user, "settings");
             settings_render(
                 &state,
                 &updated_user,
-                auth_user.lang,
-                Some(&crate::i18n::translate(
-                    auth_user.lang,
-                    "settings-saved",
-                    None,
-                )),
+                lang,
+                Some(&crate::i18n::translate(lang, "settings-saved", None)),
                 None,
                 sidebar,
                 imp,
@@ -29970,6 +29969,27 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(name.unwrap(), "Updated Name");
+    }
+
+    #[tokio::test]
+    async fn settings_save_confirms_language_change_in_the_new_language() {
+        let (app, _pool, session, _) = setup_test_app().await;
+        let csrf = "test-csrf-settings-lang";
+        let body = format!("_csrf={}&name=Test+User&booking_email=&language=fr", csrf);
+        let response = app
+            .oneshot(post_form("/dashboard/settings", &session, csrf, &body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let resp_body = body_string(response).await;
+        assert!(
+            resp_body.contains("Paramètres enregistrés"),
+            "confirmation should render in the language that was just saved"
+        );
+        assert!(
+            !resp_body.contains("Settings saved"),
+            "confirmation should not render in the pre-save language"
+        );
     }
 
     // --- Admin actions ---
