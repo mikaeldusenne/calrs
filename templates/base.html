@@ -10,7 +10,7 @@
   <meta name="color-scheme" content="light dark">
   {% endif %}
   <title>{% block title %}calrs{% endblock %}</title>
-  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🦀</text></svg>">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📅</text></svg>">
   <script>
   // Apply theme ASAP to avoid flash. In embed mode the parent controls theme
   // via ?theme= so we skip localStorage and respect the URL param only.
@@ -514,7 +514,7 @@
   {% endif %}
   <div class="container">
     {% block content %}{% endblock %}
-    {% block footer %}<div class="powered"><span>{{ t('base-powered-by') }} <a href="https://cal.rs">calrs</a> 🦀</span></div>{% endblock %}
+    {% block footer %}<div class="powered"><span>{{ t('base-powered-by') }} <a href="https://cal.rs">calrs</a> 📅</span></div>{% endblock %}
     {% block theme_toggle %}
     <button id="theme-toggle" type="button" title="{{ t('base-theme-toggle') }}" aria-label="{{ t('base-theme-toggle') }}" class="theme-pill">
       <span class="theme-pill-track">

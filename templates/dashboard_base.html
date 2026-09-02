@@ -36,10 +36,15 @@
     align-items: center;
     gap: 0.625rem;
   }
-  .sidebar-brand img {
+  .sidebar-brand-icon {
     width: 36px;
     height: 36px;
-    object-fit: contain;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 2rem;
+    line-height: 1;
+    flex-shrink: 0;
   }
   .sidebar-brand-name {
     font-weight: 700;
@@ -298,7 +303,7 @@
 
   <nav class="sidebar">
     <a href="/dashboard" class="sidebar-brand" style="text-decoration: none; color: inherit;">
-      <img src="/brand-logo" alt="calrs">
+      <span class="sidebar-brand-icon" aria-hidden="true">📅</span>
       <span class="sidebar-brand-name"><span style="color: var(--accent);">cal</span><span style="color: #e45724;">rs</span></span>
     </a>
 
