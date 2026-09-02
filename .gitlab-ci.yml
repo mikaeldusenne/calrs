@@ -7,18 +7,9 @@ build:
     - podman-deploy
   script:
     - |
-      if [ -z "${CI_REGISTRY:-}" ] ||
-         [ -z "${CI_REGISTRY_IMAGE:-}" ] ||
-         [ -z "${CI_REGISTRY_USER:-}" ] ||
-         [ -z "${CI_REGISTRY_PASSWORD:-}" ]; then
-        printf '%s\n' \
-          "GitLab Container Registry variables are unavailable." \
-          "Enable the Container Registry for both the GitLab instance and this project." >&2
-        exit 1
-      fi
-    - export IMAGE_SHA="${CI_REGISTRY_IMAGE}:podsan-${CI_COMMIT_SHORT_SHA}"
-    - export IMAGE_BRANCH="${CI_REGISTRY_IMAGE}:podsan"
-    - printf '%s' "$CI_REGISTRY_PASSWORD" | docker login "$CI_REGISTRY" --username "$CI_REGISTRY_USER" --password-stdin
+      : "${EDS_IMAGE_PREFIX:?EDS_IMAGE_PREFIX is required}"
+      export IMAGE_SHA="localhost/${EDS_IMAGE_PREFIX}-calrs:podsan-${CI_COMMIT_SHORT_SHA}"
+      export IMAGE_BRANCH="localhost/${EDS_IMAGE_PREFIX}-calrs:podsan"
     - |
       docker build \
         --build-arg EDS_IMAGE_PREFIX \
@@ -32,10 +23,5 @@ build:
         --tag "$IMAGE_SHA" \
         --tag "$IMAGE_BRANCH" \
         .
-    - docker push "$IMAGE_SHA"
-    - docker push "$IMAGE_BRANCH"
-  after_script:
-    - |
-      if [ -n "${CI_REGISTRY:-}" ]; then
-        docker logout "$CI_REGISTRY"
-      fi
+    - docker image inspect "$IMAGE_SHA" >/dev/null
+    - docker image inspect "$IMAGE_BRANCH" >/dev/null
