@@ -894,8 +894,21 @@ use openidconnect::{
 };
 
 fn build_http_client() -> Result<openidconnect::reqwest::Client> {
-    let client = openidconnect::reqwest::ClientBuilder::new()
-        .redirect(openidconnect::reqwest::redirect::Policy::none())
+    let mut builder = openidconnect::reqwest::ClientBuilder::new()
+        .redirect(openidconnect::reqwest::redirect::Policy::none());
+
+    if let Ok(ca_file) = std::env::var("SSL_CERT_FILE") {
+        let pem = std::fs::read(&ca_file)
+            .with_context(|| format!("Failed to read SSL_CERT_FILE {}", ca_file))?;
+        let certificates = openidconnect::reqwest::Certificate::from_pem_bundle(&pem)
+            .map_err(|e| anyhow::anyhow!("Failed to parse SSL_CERT_FILE {}: {}", ca_file, e))?;
+
+        for certificate in certificates {
+            builder = builder.add_root_certificate(certificate);
+        }
+    }
+
+    let client = builder
         .build()
         .map_err(|e| anyhow::anyhow!("Failed to build HTTP client: {}", e))?;
     Ok(client)
