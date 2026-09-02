@@ -1359,7 +1359,7 @@ async fn find_or_create_oidc_user(
     // atomic with the row creation; see create_local_user for the rationale.
     sqlx::query(
         "INSERT INTO users (id, email, name, timezone, role, auth_provider, oidc_subject, username)
-         VALUES (?, ?, ?, 'UTC',
+         VALUES (?, ?, ?, 'Europe/Paris',
                  CASE WHEN NOT EXISTS (SELECT 1 FROM users) THEN 'admin' ELSE 'user' END,
                  'oidc', ?, ?)",
     )
@@ -1388,7 +1388,7 @@ async fn find_or_create_oidc_user(
     } else {
         let account_id = uuid::Uuid::new_v4().to_string();
         sqlx::query(
-            "INSERT INTO accounts (id, name, email, timezone, user_id) VALUES (?, ?, ?, 'UTC', ?)",
+            "INSERT INTO accounts (id, name, email, timezone, user_id) VALUES (?, ?, ?, 'Europe/Paris', ?)",
         )
         .bind(&account_id)
         .bind(name)
