@@ -13,12 +13,14 @@ The `podsan` branch carries the small set of changes required by the PodSaN depl
 
 ## Image build
 
-When this branch is mirrored to GitLab, `.gitlab-ci.yml` publishes two image tags:
+When this branch is mirrored to GitLab, `.gitlab-ci.yml` builds two image tags in the Podman store shared with the trusted `podman-deploy` runner:
 
-- `podsan-<short commit SHA>`: immutable traceable build;
-- `podsan`: moving deployment tag.
+- `localhost/${EDS_IMAGE_PREFIX}-calrs:podsan-<short commit SHA>`: traceable build;
+- `localhost/${EDS_IMAGE_PREFIX}-calrs:podsan`: moving deployment tag.
 
-The GitLab project hosting this mirror must use the trusted `podman-deploy` runner and enable its Container Registry.
+No container registry is required. The deployment project consumes the moving local tag directly and should verify that it exists before starting.
+
+This design assumes that both pipelines use runners connected to the same Podman socket. Build the fork image again after storage cleanup or before deploying from another host.
 
 ## Updating from upstream
 
