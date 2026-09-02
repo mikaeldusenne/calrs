@@ -17874,11 +17874,10 @@ async fn admin_update_smtp(
             .await
         }
         None => {
-            // Fresh config needs a password — there is nothing to keep.
-            if !password_provided {
-                return redirect_err(
-                    "A password is required when configuring SMTP for the first time.",
-                );
+            // Trusted internal relays may intentionally use no SMTP auth.
+            let username_provided = !username.is_empty();
+            if username_provided != password_provided {
+                return redirect_err("SMTP username and password must be provided together.");
             }
             let password_enc = match crate::crypto::encrypt_password(&state.secret_key, &password) {
                 Ok(s) => s,
