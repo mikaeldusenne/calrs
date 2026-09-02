@@ -65,6 +65,15 @@ pub enum ResourceCheck {
 /// Fetch the raw ICS publish feed. An empty body with a calendar
 /// content-type is a valid, empty calendar (BlueMind behaviour).
 pub async fn fetch_feed(feed_url: &str) -> anyhow::Result<String> {
+    fetch_feed_with_auth(feed_url, None, None).await
+}
+
+/// Fetch an ICS feed, optionally using the resource's CalDAV credentials.
+pub async fn fetch_feed_with_auth(
+    feed_url: &str,
+    username: Option<&str>,
+    password: Option<&str>,
+) -> anyhow::Result<String> {
     // Re-validate on every fetch, not just at configuration time: the
     // stored URL's host may have started resolving to an internal address
     // since (and background re-syncs are triggered from public pages).
@@ -75,7 +84,11 @@ pub async fn fetch_feed(feed_url: &str) -> anyhow::Result<String> {
         .timeout(std::time::Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
-    let mut resp = client.get(feed_url).send().await?;
+    let mut request = client.get(feed_url);
+    if let Some(username) = username.filter(|u| !u.trim().is_empty()) {
+        request = request.basic_auth(username, password);
+    }
+    let mut resp = request.send().await?;
     if !resp.status().is_success() {
         anyhow::bail!("feed returned HTTP {}", resp.status());
     }
@@ -99,6 +112,45 @@ pub async fn fetch_feed(feed_url: &str) -> anyhow::Result<String> {
         anyhow::bail!("URL did not return an ICS calendar");
     }
     Ok(body)
+}
+
+/// Load and decrypt the credentials already stored for a resource.
+pub async fn stored_feed_credentials(
+    pool: &SqlitePool,
+    secret_key: &[u8; 32],
+    resource_id: &str,
+) -> anyhow::Result<(Option<String>, Option<String>)> {
+    let row: Option<(Option<String>, Option<String>)> =
+        sqlx::query_as("SELECT caldav_username, caldav_password FROM resources WHERE id = ?")
+            .bind(resource_id)
+            .fetch_optional(pool)
+            .await?;
+    let Some((username, password_enc)) = row else {
+        return Ok((None, None));
+    };
+    let password = password_enc
+        .as_deref()
+        .map(|p| crate::crypto::decrypt_password(secret_key, p))
+        .transpose()?;
+    Ok((username.filter(|u| !u.trim().is_empty()), password))
+}
+
+/// Sync using the credentials stored for this resource.
+pub async fn sync_resource_stored(
+    pool: &SqlitePool,
+    secret_key: &[u8; 32],
+    resource_id: &str,
+    feed_url: &str,
+) -> anyhow::Result<u32> {
+    let (username, password) = stored_feed_credentials(pool, secret_key, resource_id).await?;
+    sync_resource_with_auth(
+        pool,
+        resource_id,
+        feed_url,
+        username.as_deref(),
+        password.as_deref(),
+    )
+    .await
 }
 
 /// Derive the CalDAV collection URL from a BlueMind publish URL.
@@ -154,7 +206,18 @@ pub async fn sync_resource(
     resource_id: &str,
     feed_url: &str,
 ) -> anyhow::Result<u32> {
-    let body = match fetch_feed(feed_url).await {
+    sync_resource_with_auth(pool, resource_id, feed_url, None, None).await
+}
+
+/// Sync a resource feed using optional HTTP Basic credentials.
+pub async fn sync_resource_with_auth(
+    pool: &SqlitePool,
+    resource_id: &str,
+    feed_url: &str,
+    username: Option<&str>,
+    password: Option<&str>,
+) -> anyhow::Result<u32> {
+    let body = match fetch_feed_with_auth(feed_url, username, password).await {
         Ok(b) => b,
         Err(e) => {
             // Stamp the attempt (backoff) and record the failure for the
@@ -269,6 +332,23 @@ pub async fn sync_resource(
 /// [`SYNC_STALE_MINUTES`]. Failures are logged and skipped: a dead feed must
 /// not break the booking page (the cache keeps serving the last state).
 pub async fn sync_if_stale(pool: &SqlitePool, resource_ids: &[String]) {
+    sync_if_stale_impl(pool, None, resource_ids).await;
+}
+
+/// Sync stale resource feeds using each resource's stored credentials.
+pub async fn sync_if_stale_with_key(
+    pool: &SqlitePool,
+    secret_key: &[u8; 32],
+    resource_ids: &[String],
+) {
+    sync_if_stale_impl(pool, Some(secret_key), resource_ids).await;
+}
+
+async fn sync_if_stale_impl(
+    pool: &SqlitePool,
+    secret_key: Option<&[u8; 32]>,
+    resource_ids: &[String],
+) {
     for rid in resource_ids {
         let row: Option<(String, Option<String>)> =
             sqlx::query_as("SELECT feed_url, last_synced_at FROM resources WHERE id = ?")
@@ -290,7 +370,11 @@ pub async fn sync_if_stale(pool: &SqlitePool, resource_ids: &[String]) {
         if stale {
             // sync_resource stamps last_synced_at on failure too (backoff)
             // and records last_sync_error for the admin panel.
-            if let Err(e) = sync_resource(pool, rid, &feed_url).await {
+            let result = match secret_key {
+                Some(key) => sync_resource_stored(pool, key, rid, &feed_url).await,
+                None => sync_resource(pool, rid, &feed_url).await,
+            };
+            if let Err(e) = result {
                 tracing::warn!(resource_id = %rid, error = %e, "resource feed sync failed");
             }
         }

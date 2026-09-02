@@ -4539,7 +4539,7 @@ async fn confirm_booking(
         if ids.is_empty() {
             None
         } else {
-            crate::resources::sync_if_stale(&state.pool, &ids).await;
+            crate::resources::sync_if_stale_with_key(&state.pool, &state.secret_key, &ids).await;
             Some(crate::resources::booking_lock().await)
         }
     };
@@ -10502,7 +10502,8 @@ async fn handle_group_booking(
     let resource_guard = if resource_ids.is_empty() {
         None
     } else {
-        crate::resources::sync_if_stale(&state.pool, &resource_ids).await;
+        crate::resources::sync_if_stale_with_key(&state.pool, &state.secret_key, &resource_ids)
+            .await;
         Some(crate::resources::booking_lock().await)
     };
     let assigned_resource_id = match crate::resources::check_and_pick(
@@ -11519,7 +11520,8 @@ async fn handle_dynamic_group_booking(
     let resource_guard = if resource_ids.is_empty() {
         None
     } else {
-        crate::resources::sync_if_stale(&state.pool, &resource_ids).await;
+        crate::resources::sync_if_stale_with_key(&state.pool, &state.secret_key, &resource_ids)
+            .await;
         Some(crate::resources::booking_lock().await)
     };
     let assigned_resource_id = match crate::resources::check_and_pick(
@@ -12479,7 +12481,8 @@ async fn handle_booking_for_user(
     let resource_guard = if resource_ids.is_empty() {
         None
     } else {
-        crate::resources::sync_if_stale(&state.pool, &resource_ids).await;
+        crate::resources::sync_if_stale_with_key(&state.pool, &state.secret_key, &resource_ids)
+            .await;
         Some(crate::resources::booking_lock().await)
     };
     let assigned_resource_id = match crate::resources::check_and_pick(
@@ -15123,7 +15126,8 @@ async fn handle_booking(
     let resource_guard = if resource_ids.is_empty() {
         None
     } else {
-        crate::resources::sync_if_stale(&state.pool, &resource_ids).await;
+        crate::resources::sync_if_stale_with_key(&state.pool, &state.secret_key, &resource_ids)
+            .await;
         Some(crate::resources::booking_lock().await)
     };
     let assigned_resource_id = match crate::resources::check_and_pick(
@@ -16671,7 +16675,16 @@ async fn admin_create_resource(
         return admin_resources_redirect_err(&format!("Invalid feed URL: {}", e));
     }
     // The feed must answer before we store anything, and it gives us the name.
-    let body = match crate::resources::fetch_feed(&feed_url).await {
+    let body = match crate::resources::fetch_feed_with_auth(
+        &feed_url,
+        form.caldav_username
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty()),
+        form.caldav_password.as_deref().filter(|s| !s.is_empty()),
+    )
+    .await
+    {
         Ok(b) => b,
         Err(e) => {
             return admin_resources_redirect_err(&format!("Feed check failed: {}", e));
@@ -16729,9 +16742,10 @@ async fn admin_create_resource(
     .await;
     save_resource_teams(&state.pool, &id, &form.team_ids).await;
 
-    let cached = crate::resources::sync_resource(&state.pool, &id, &feed_url)
-        .await
-        .unwrap_or(0);
+    let cached =
+        crate::resources::sync_resource_stored(&state.pool, &state.secret_key, &id, &feed_url)
+            .await
+            .unwrap_or(0);
     tracing::info!(resource_name = %name, admin = %_admin.user.email, "admin: resource created");
     admin_resources_redirect(&format!(
         "Resource \"{}\" added ({} event(s) cached).",
@@ -16766,7 +16780,43 @@ async fn admin_update_resource(
     // Same contract as create: the feed must answer before we store it, so
     // a typo'd URL is caught now instead of silently serving stale events
     // for up to 5 minutes.
-    if let Err(e) = crate::resources::fetch_feed(&feed_url).await {
+    let stored_password = if form
+        .caldav_password
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .is_none()
+    {
+        match crate::resources::stored_feed_credentials(
+            &state.pool,
+            &state.secret_key,
+            &resource_id,
+        )
+        .await
+        {
+            Ok((_, password)) => password,
+            Err(e) => {
+                return admin_resources_redirect_err(&format!(
+                    "Could not read stored credentials: {}",
+                    e
+                ));
+            }
+        }
+    } else {
+        None
+    };
+    if let Err(e) = crate::resources::fetch_feed_with_auth(
+        &feed_url,
+        form.caldav_username
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty()),
+        form.caldav_password
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .or(stored_password.as_deref()),
+    )
+    .await
+    {
         return admin_resources_redirect_err(&format!("Feed check failed: {}", e));
     }
     let name = form
@@ -16814,9 +16864,14 @@ async fn admin_update_resource(
         }
     }
     save_resource_teams(&state.pool, &resource_id, &form.team_ids).await;
-    let cached = crate::resources::sync_resource(&state.pool, &resource_id, &feed_url)
-        .await
-        .unwrap_or(0);
+    let cached = crate::resources::sync_resource_stored(
+        &state.pool,
+        &state.secret_key,
+        &resource_id,
+        &feed_url,
+    )
+    .await
+    .unwrap_or(0);
     admin_resources_redirect(&format!("Resource updated ({} event(s) cached).", cached))
 }
 
@@ -16857,7 +16912,14 @@ async fn admin_sync_resource(
     let Some(feed_url) = feed_url else {
         return admin_resources_redirect_err("Resource not found.");
     };
-    match crate::resources::sync_resource(&state.pool, &resource_id, &feed_url).await {
+    match crate::resources::sync_resource_stored(
+        &state.pool,
+        &state.secret_key,
+        &resource_id,
+        &feed_url,
+    )
+    .await
+    {
         Ok(n) => admin_resources_redirect(&format!("Feed synced, {} event(s) cached.", n)),
         Err(e) => admin_resources_redirect_err(&format!("Sync failed: {}", e)),
     }
@@ -18907,7 +18969,7 @@ async fn approve_booking_by_token(
         if ids.is_empty() {
             None
         } else {
-            crate::resources::sync_if_stale(&state.pool, &ids).await;
+            crate::resources::sync_if_stale_with_key(&state.pool, &state.secret_key, &ids).await;
             Some(crate::resources::booking_lock().await)
         }
     };
@@ -20284,7 +20346,12 @@ async fn guest_reschedule_booking(
     let resource_guard = if resched_resource_ids.is_empty() {
         None
     } else {
-        crate::resources::sync_if_stale(&state.pool, &resched_resource_ids).await;
+        crate::resources::sync_if_stale_with_key(
+            &state.pool,
+            &state.secret_key,
+            &resched_resource_ids,
+        )
+        .await;
         Some(crate::resources::booking_lock().await)
     };
     let new_resource_assignment = match crate::resources::check_and_pick(
