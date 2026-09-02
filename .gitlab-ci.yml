@@ -1,0 +1,29 @@
+workflow:
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "podsan"'
+
+build:
+  tags:
+    - podman-deploy
+  script:
+    - export IMAGE_SHA="${CI_REGISTRY_IMAGE}:podsan-${CI_COMMIT_SHORT_SHA}"
+    - export IMAGE_BRANCH="${CI_REGISTRY_IMAGE}:podsan"
+    - printf '%s' "$CI_REGISTRY_PASSWORD" | docker login "$CI_REGISTRY" --username "$CI_REGISTRY_USER" --password-stdin
+    - |
+      docker build \
+        --pull \
+        --build-arg EDS_IMAGE_PREFIX \
+        --build-arg HTTP_PROXY \
+        --build-arg HTTPS_PROXY \
+        --build-arg NO_PROXY \
+        --build-arg http_proxy \
+        --build-arg https_proxy \
+        --build-arg no_proxy \
+        --label "org.opencontainers.image.revision=$CI_COMMIT_SHA" \
+        --tag "$IMAGE_SHA" \
+        --tag "$IMAGE_BRANCH" \
+        .
+    - docker push "$IMAGE_SHA"
+    - docker push "$IMAGE_BRANCH"
+  after_script:
+    - docker logout "$CI_REGISTRY"
