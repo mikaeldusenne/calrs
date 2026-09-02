@@ -6,6 +6,16 @@ build:
   tags:
     - podman-deploy
   script:
+    - |
+      if [ -z "${CI_REGISTRY:-}" ] ||
+         [ -z "${CI_REGISTRY_IMAGE:-}" ] ||
+         [ -z "${CI_REGISTRY_USER:-}" ] ||
+         [ -z "${CI_REGISTRY_PASSWORD:-}" ]; then
+        printf '%s\n' \
+          "GitLab Container Registry variables are unavailable." \
+          "Enable the Container Registry for both the GitLab instance and this project." >&2
+        exit 1
+      fi
     - export IMAGE_SHA="${CI_REGISTRY_IMAGE}:podsan-${CI_COMMIT_SHORT_SHA}"
     - export IMAGE_BRANCH="${CI_REGISTRY_IMAGE}:podsan"
     - printf '%s' "$CI_REGISTRY_PASSWORD" | docker login "$CI_REGISTRY" --username "$CI_REGISTRY_USER" --password-stdin
@@ -25,4 +35,7 @@ build:
     - docker push "$IMAGE_SHA"
     - docker push "$IMAGE_BRANCH"
   after_script:
-    - docker logout "$CI_REGISTRY"
+    - |
+      if [ -n "${CI_REGISTRY:-}" ]; then
+        docker logout "$CI_REGISTRY"
+      fi
