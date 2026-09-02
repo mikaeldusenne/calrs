@@ -11,7 +11,6 @@ build:
     - printf '%s' "$CI_REGISTRY_PASSWORD" | docker login "$CI_REGISTRY" --username "$CI_REGISTRY_USER" --password-stdin
     - |
       docker build \
-        --pull \
         --build-arg EDS_IMAGE_PREFIX \
         --build-arg HTTP_PROXY \
         --build-arg HTTPS_PROXY \
