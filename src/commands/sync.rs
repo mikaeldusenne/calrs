@@ -14,11 +14,25 @@ use crate::utils::{extract_vevent_field, extract_vevent_tzid, split_vevents};
 /// Default staleness threshold: 5 minutes
 const STALE_SECS: i64 = 300;
 
-/// Look-back window for full-fetch path. Bounded so Google CalDAV, which
-/// truncates the forward window of unfiltered REPORTs, returns future events
-/// via the `time-range` filter. 90 days keeps recent history available for
-/// orphan/cancellation detection without ballooning the response.
-const FULL_FETCH_LOOKBACK_DAYS: i64 = 90;
+/// Default look-back window for full-fetch syncs.
+const DEFAULT_FULL_FETCH_LOOKBACK_DAYS: i64 = 7;
+
+/// Parse the optional full-fetch look-back override.
+fn parse_full_fetch_lookback_days(value: Option<&str>) -> i64 {
+    value
+        .map(str::trim)
+        .and_then(|days| days.parse::<u32>().ok())
+        .map(i64::from)
+        .unwrap_or(DEFAULT_FULL_FETCH_LOOKBACK_DAYS)
+}
+
+fn full_fetch_lookback_days() -> i64 {
+    parse_full_fetch_lookback_days(
+        std::env::var("CALRS_SYNC_LOOKBACK_DAYS")
+            .ok()
+            .as_deref(),
+    )
+}
 
 /// Per-source async mutexes used by `sync_if_stale` to dedupe in-flight
 /// syncs. Without this, concurrent on-demand calls (e.g. several booking
@@ -224,7 +238,7 @@ pub async fn sync_source(
             // forward window). fetch_events_since falls back to the unfiltered
             // REPORT if the server rejects time-range, so other servers are
             // unaffected.
-            let since_dt = Utc::now() - chrono::Duration::days(FULL_FETCH_LOOKBACK_DAYS);
+            let since_dt = Utc::now() - chrono::Duration::days(full_fetch_lookback_days());
             let since_iso = since_dt.format("%Y%m%dT%H%M%SZ").to_string();
             let since_prefix = since_dt.format("%Y%m%d").to_string();
             match client.fetch_events_since(&cal_info.href, &since_iso).await {
@@ -500,7 +514,7 @@ pub async fn sync_ews_source(
     // 90 days back is plenty for orphan reconciliation and keeps EWS response
     // sizes predictable. The provider's fetch_events_since uses CalendarView,
     // which expands recurrences server-side within the window.
-    let since_dt = Utc::now() - chrono::Duration::days(FULL_FETCH_LOOKBACK_DAYS);
+    let since_dt = Utc::now() - chrono::Duration::days(full_fetch_lookback_days());
     let since_iso = since_dt.to_rfc3339();
     let since_prefix = since_dt.format("%Y%m%d").to_string();
 
@@ -1213,6 +1227,15 @@ mod tests {
     use super::*;
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
     use std::str::FromStr;
+
+    #[test]
+    fn full_fetch_lookback_days_defaults_and_accepts_valid_overrides() {
+        assert_eq!(parse_full_fetch_lookback_days(None), 7);
+        assert_eq!(parse_full_fetch_lookback_days(Some("30")), 30);
+        assert_eq!(parse_full_fetch_lookback_days(Some(" 0 ")), 0);
+        assert_eq!(parse_full_fetch_lookback_days(Some("-1")), 7);
+        assert_eq!(parse_full_fetch_lookback_days(Some("invalid")), 7);
+    }
 
     async fn setup_test_db() -> SqlitePool {
         let pool = SqlitePoolOptions::new()
