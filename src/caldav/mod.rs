@@ -1010,15 +1010,22 @@ mod tests {
     /// Headers may arrive before a large calendar body stalls.
     #[tokio::test]
     async fn diagnostics_distinguish_body_timeout_from_http_status() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut buffer = [0; 4096];
-            stream.read(&mut buffer).await.unwrap();
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = BufReader::new(stream);
+            loop {
+                let mut line = String::new();
+                assert!(stream.read_line(&mut line).await.unwrap() > 0);
+                if line == "\r\n" {
+                    break;
+                }
+            }
             stream
+                .get_mut()
                 .write_all(b"HTTP/1.1 207 Multi-Status\r\nContent-Length: 1000\r\n\r\n")
                 .await
                 .unwrap();
