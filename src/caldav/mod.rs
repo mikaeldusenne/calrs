@@ -218,7 +218,7 @@ impl CaldavClient {
             bail!("PROPFIND {} returned {}: {}", url, status, snippet);
         }
 
-        Ok(resp.text().await?)
+        resp.text().await
     }
 
     /// Check if the server supports CalDAV.
