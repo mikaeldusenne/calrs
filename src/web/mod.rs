@@ -6935,7 +6935,13 @@ async fn run_sync_for_source(
         Err(e) => return (vec![format!("Failed to build client: {}", e)], 0),
     };
 
-    match crate::commands::sync::sync_source(pool, key, &client, source_id).await {
+    match crate::sync_diagnostics::sync(
+        source_id,
+        "dashboard",
+        crate::commands::sync::sync_source(pool, key, &client, source_id),
+    )
+    .await
+    {
         Ok(()) => {
             let cal_count: i64 =
                 sqlx::query_scalar("SELECT COUNT(*) FROM calendars WHERE source_id = ?")
@@ -6982,7 +6988,13 @@ async fn run_sync(
         }
     } else {
         let client = crate::caldav::CaldavClient::new(url, username, password);
-        match crate::commands::sync::sync_source(pool, key, &client, source_id).await {
+        match crate::sync_diagnostics::sync(
+            source_id,
+            "source_setup",
+            crate::commands::sync::sync_source(pool, key, &client, source_id),
+        )
+        .await
+        {
             Ok(()) => {
                 let cal_count: i64 =
                     sqlx::query_scalar("SELECT COUNT(*) FROM calendars WHERE source_id = ?")

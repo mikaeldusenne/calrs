@@ -1,3 +1,4 @@
+use crate::sync_diagnostics::RequestDiagnostics;
 use anyhow::{bail, Result};
 use reqwest::{Client, RequestBuilder};
 use std::net::IpAddr;
@@ -203,7 +204,7 @@ impl CaldavClient {
             .header("Content-Type", "application/xml; charset=utf-8")
             .header("Depth", depth)
             .body(body.to_string())
-            .send()
+            .send_observed("propfind")
             .await?;
 
         let status = resp.status();
@@ -217,7 +218,7 @@ impl CaldavClient {
             bail!("PROPFIND {} returned {}: {}", url, status, snippet);
         }
 
-        Ok(resp.text().await?)
+        resp.text().await
     }
 
     /// Check if the server supports CalDAV.
@@ -445,7 +446,7 @@ impl CaldavClient {
             .header("Depth", "1")
             .timeout(Duration::from_secs(60))
             .body(REPORT_CALENDAR_DATA)
-            .send()
+            .send_observed("unfiltered")
             .await?;
 
         let text = resp.text().await?;
@@ -484,7 +485,11 @@ impl CaldavClient {
             .header("Content-Type", "application/xml; charset=utf-8")
             .timeout(Duration::from_secs(60))
             .body(body)
-            .send()
+            .send_observed(if sync_token.is_some() {
+                "delta"
+            } else {
+                "initial_token"
+            })
             .await?;
 
         let status = resp.status();
@@ -509,6 +514,7 @@ impl CaldavClient {
         since_utc: &str,
     ) -> Result<Vec<RawEvent>> {
         let url = self.resolve_url(calendar_href);
+        crate::sync_diagnostics::window_start(since_utc);
 
         let body = format!(
             r#"<?xml version="1.0" encoding="utf-8"?>
@@ -537,7 +543,7 @@ impl CaldavClient {
             .header("Depth", "1")
             .timeout(Duration::from_secs(60))
             .body(body)
-            .send()
+            .send_observed("time_range")
             .await?;
 
         let status = resp.status();

@@ -21,6 +21,7 @@ mod resources;
 mod rrule;
 mod settings;
 mod sms;
+mod sync_diagnostics;
 #[cfg(test)]
 mod test_support;
 mod utils;

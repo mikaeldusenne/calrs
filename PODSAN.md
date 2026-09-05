@@ -22,6 +22,11 @@ No container registry is required. The deployment project consumes the moving lo
 
 This design assumes that both pipelines use runners connected to the same Podman socket. Build the fork image again after storage cleanup or before deploying from another host.
 
+## Sync diagnostics
+
+For slow calendar syncs or dashboard HTTP 504s, see [sync diagnostics](docs/podsan-sync-diagnostics.md).
+The observer and its tests live in `src/sync_diagnostics.rs` and `src/sync_diagnostics/`; keep upstream changes limited to the documented observation points.
+
 ## Updating from upstream
 
 1. Fast-forward `main` from `olivierlambert/calrs`.

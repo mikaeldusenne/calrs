@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 use crate::caldav::{CaldavClient, RawEvent};
 use crate::providers::{factory::kinds, RawEvent as ProviderRawEvent};
+use crate::sync_diagnostics::{self as diagnostics, trace};
 use crate::utils::{extract_vevent_field, extract_vevent_tzid, split_vevents};
 
 /// Default staleness threshold: 5 minutes
@@ -27,11 +28,7 @@ fn parse_full_fetch_lookback_days(value: Option<&str>) -> i64 {
 }
 
 fn full_fetch_lookback_days() -> i64 {
-    parse_full_fetch_lookback_days(
-        std::env::var("CALRS_SYNC_LOOKBACK_DAYS")
-            .ok()
-            .as_deref(),
-    )
+    parse_full_fetch_lookback_days(std::env::var("CALRS_SYNC_LOOKBACK_DAYS").ok().as_deref())
 }
 
 /// Per-source async mutexes used by `sync_if_stale` to dedupe in-flight
@@ -127,7 +124,9 @@ pub async fn run(pool: &SqlitePool, key: &[u8; 32], full: bool) -> Result<()> {
         )
         .await?;
 
-        if let Err(e) = sync_source(pool, key, &client, source_id).await {
+        if let Err(e) =
+            diagnostics::sync(source_id, "cli", sync_source(pool, key, &client, source_id)).await
+        {
             println!("  {} Sync failed: {}", "✗".red(), e);
             continue;
         }
@@ -146,9 +145,13 @@ pub async fn sync_source(
     client: &CaldavClient,
     source_id: &str,
 ) -> Result<()> {
-    let principal = client.discover_principal().await?;
-    let calendar_home = client.discover_calendar_home(&principal).await?;
-    let calendars = client.list_calendars(&calendar_home).await?;
+    let principal = trace("discover_principal", client.discover_principal()).await?;
+    let calendar_home = trace(
+        "discover_calendar_home",
+        client.discover_calendar_home(&principal),
+    )
+    .await?;
+    let calendars = trace("list_calendars", client.list_calendars(&calendar_home)).await?;
 
     let mut did_full_sync = false;
 
@@ -170,7 +173,7 @@ pub async fn sync_source(
 
         // Try sync-token delta if we have one stored
         let delta_ok = if let Some(token) = &stored_sync_token {
-            match client.sync_collection(&cal_info.href, Some(token)).await {
+            match trace("delta", client.sync_collection(&cal_info.href, Some(token))).await {
                 Ok(result) => {
                     // If ctag changed but sync-collection reports nothing, the server's
                     // sync-token implementation is incomplete (e.g. BlueMind doesn't report
@@ -241,8 +244,14 @@ pub async fn sync_source(
             let since_dt = Utc::now() - chrono::Duration::days(full_fetch_lookback_days());
             let since_iso = since_dt.format("%Y%m%dT%H%M%SZ").to_string();
             let since_prefix = since_dt.format("%Y%m%d").to_string();
-            match client.fetch_events_since(&cal_info.href, &since_iso).await {
+            match trace(
+                "fetch_events",
+                client.fetch_events_since(&cal_info.href, &since_iso),
+            )
+            .await
+            {
                 Ok(raw_events) => {
+                    diagnostics::event_count(raw_events.len());
                     let count = upsert_raw_events(pool, &cal_id, &raw_events).await;
 
                     // Remove events that no longer exist on the server, but only
@@ -271,11 +280,13 @@ pub async fn sync_source(
                         cal_info.sync_token.clone()
                     } else {
                         // Try an empty sync-collection to get initial token
-                        client
-                            .sync_collection(&cal_info.href, None)
-                            .await
-                            .ok()
-                            .and_then(|r| r.new_sync_token)
+                        trace(
+                            "initial_token",
+                            client.sync_collection(&cal_info.href, None),
+                        )
+                        .await
+                        .ok()
+                        .and_then(|r| r.new_sync_token)
                     };
                     update_calendar_sync_state(pool, &cal_id, &cal_info.ctag, &new_token).await;
 
@@ -415,7 +426,12 @@ pub async fn sync_if_stale(pool: &SqlitePool, key: &[u8; 32], user_id: &str) {
             Ok(c) => c,
             Err(_) => continue,
         };
-        let _ = sync_source(pool, key, &client, source_id).await;
+        let _ = diagnostics::sync(
+            source_id,
+            "on_demand",
+            sync_source(pool, key, &client, source_id),
+        )
+        .await;
     }
 }
 
@@ -493,7 +509,12 @@ pub async fn sync_source_by_id(pool: &SqlitePool, key: &[u8; 32], source_id: &st
         Ok(c) => c,
         Err(_) => return,
     };
-    let _ = sync_source(pool, key, &client, source_id).await;
+    let _ = diagnostics::sync(
+        source_id,
+        "background",
+        sync_source(pool, key, &client, source_id),
+    )
+    .await;
 }
 
 /// EWS-specific sync path using the [`crate::providers::CalendarProvider`]
