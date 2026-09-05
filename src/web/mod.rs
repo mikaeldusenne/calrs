@@ -591,7 +591,7 @@ pub async fn run_reminder_loop(pool: SqlitePool, secret_key: [u8; 32]) {
 
         if let Some((source_id,)) = stalest {
             crate::commands::sync::sync_source_by_id(&pool, &secret_key, &source_id).await;
-            tracing::debug!(source_id = %source_id, "background sync attempt returned");
+            tracing::debug!(source_id = %source_id, "background sync completed");
         }
     }
 }
@@ -6885,7 +6885,6 @@ async fn test_source(
 }
 
 /// Runs CalDAV sync using build_client_for_source (supports both basic and OAuth2).
-#[tracing::instrument(skip_all, fields(trigger = "dashboard", source_id = source_id))]
 async fn run_sync_for_source(
     pool: &SqlitePool,
     key: &[u8; 32],
@@ -6936,7 +6935,13 @@ async fn run_sync_for_source(
         Err(e) => return (vec![format!("Failed to build client: {}", e)], 0),
     };
 
-    match crate::commands::sync::sync_source(pool, key, &client, source_id).await {
+    match crate::sync_diagnostics::sync(
+        source_id,
+        "dashboard",
+        crate::commands::sync::sync_source(pool, key, &client, source_id),
+    )
+    .await
+    {
         Ok(()) => {
             let cal_count: i64 =
                 sqlx::query_scalar("SELECT COUNT(*) FROM calendars WHERE source_id = ?")
@@ -6953,7 +6958,6 @@ async fn run_sync_for_source(
 /// Run discovery + sync for a freshly-created source with plaintext password.
 /// Dispatches on `provider_type`: EWS goes through the trait-based path,
 /// CalDAV reuses the existing `CaldavClient` + `sync_source` flow.
-#[tracing::instrument(skip_all, fields(trigger = "source_setup", source_id = source_id))]
 async fn run_sync(
     pool: &SqlitePool,
     key: &[u8; 32],
@@ -6984,7 +6988,13 @@ async fn run_sync(
         }
     } else {
         let client = crate::caldav::CaldavClient::new(url, username, password);
-        match crate::commands::sync::sync_source(pool, key, &client, source_id).await {
+        match crate::sync_diagnostics::sync(
+            source_id,
+            "source_setup",
+            crate::commands::sync::sync_source(pool, key, &client, source_id),
+        )
+        .await
+        {
             Ok(()) => {
                 let cal_count: i64 =
                     sqlx::query_scalar("SELECT COUNT(*) FROM calendars WHERE source_id = ?")

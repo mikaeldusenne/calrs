@@ -1,4 +1,4 @@
-//! Metadata-only sync diagnostics. Never format arbitrary errors or HTTP bodies.
+//! PodSaN diagnostics: observe existing futures/HTTP responses without changing their results.
 
 use anyhow::Result;
 use std::{future::Future, time::Instant};
@@ -6,22 +6,9 @@ use tracing::{Instrument, Span};
 
 pub(crate) const TARGET: &str = "calrs::sync_diagnostics";
 
-#[derive(Debug)]
-pub(crate) struct HttpStatus(pub reqwest::StatusCode);
-
-impl std::fmt::Display for HttpStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "CalDAV request returned HTTP {}", self.0.as_u16())
-    }
-}
-
-impl std::error::Error for HttpStatus {}
-
 /// Classify errors without exposing URLs, credentials, SQL values or response bodies.
 pub(crate) fn error_kind(error: &anyhow::Error) -> &'static str {
-    if error.downcast_ref::<HttpStatus>().is_some() {
-        "http_status"
-    } else if let Some(error) = error.downcast_ref::<reqwest::Error>() {
+    if let Some(error) = error.downcast_ref::<reqwest::Error>() {
         if error.is_timeout() {
             "timeout"
         } else if error.is_connect() {
@@ -86,7 +73,6 @@ pub(crate) fn trace<T>(
                     let http_status = error
                         .downcast_ref::<reqwest::Error>()
                         .and_then(|e| e.status())
-                        .or_else(|| error.downcast_ref::<HttpStatus>().map(|e| e.0))
                         .map(|status| status.as_u16());
                     let io_kind = error
                         .chain()
@@ -107,51 +93,70 @@ pub(crate) fn trace<T>(
     )
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io::Write;
-    use std::sync::{Arc, Mutex};
-    use tracing::instrument::WithSubscriber;
+/// Correlate one existing sync attempt without copying its implementation.
+pub(crate) fn sync<T>(
+    source_id: &str,
+    trigger: &'static str,
+    future: impl Future<Output = Result<T>>,
+) -> impl Future<Output = Result<T>> {
+    Box::pin(
+        async move { trace("sync", future).await }.instrument(tracing::info_span!(
+            "calendar_sync", sync_id = %uuid::Uuid::new_v4(), source_id, trigger
+        )),
+    )
+}
 
-    #[derive(Clone, Default)]
-    struct Capture(Arc<Mutex<Vec<u8>>>);
+/// Extension point for the existing CalDAV request chains.
+pub(crate) trait RequestDiagnostics {
+    fn send_observed(
+        self,
+        request_kind: &'static str,
+    ) -> impl Future<Output = Result<ObservedResponse>> + Send;
+}
 
-    impl Write for Capture {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    #[tokio::test]
-    async fn diagnostics_redact_errors_and_report_dropped_futures() {
-        let capture = Capture::default();
-        let writer = capture.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_ansi(false)
-            .without_time()
-            .with_writer(move || writer.clone())
-            .finish();
-        async {
-            let error = trace::<()>("private_failure", async {
-                Err(anyhow::anyhow!("https://user:SECRET@host/private?token=SECRET <calendar-data>SECRET</calendar-data>"))
-            }).await;
-            assert!(error.is_err());
-            let abandoned = trace::<()>("pending_request", std::future::pending());
-            assert!(tokio::time::timeout(std::time::Duration::from_millis(1), abandoned).await.is_err());
-        }.with_subscriber(subscriber).await;
-        let logs = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
-        assert!(logs.contains("stage=\"private_failure\""));
-        assert!(logs.contains("error_kind=\"application\""));
-        assert!(logs.contains("outcome=\"abandoned\""));
-        assert!(!logs.contains("outcome=\"ok\""));
-        for sensitive in ["SECRET", "https://", "calendar-data"] {
-            assert!(!logs.contains(sensitive));
-        }
+impl RequestDiagnostics for reqwest::RequestBuilder {
+    fn send_observed(
+        self,
+        request_kind: &'static str,
+    ) -> impl Future<Output = Result<ObservedResponse>> + Send {
+        async move {
+            let response = trace("response_headers", async { Ok(self.send().await?) }).await?;
+            tracing::info!(target: TARGET, http_status = response.status().as_u16(), "HTTP response headers received");
+            Ok(ObservedResponse { response, span: Span::current() })
+        }.instrument(tracing::info_span!(
+            "caldav_request", request_id = %uuid::Uuid::new_v4(), request_kind
+        ))
     }
 }
+
+/// Only observes the two response operations used by CalDAV: status and text.
+pub(crate) struct ObservedResponse {
+    response: reqwest::Response,
+    span: Span,
+}
+
+impl ObservedResponse {
+    pub(crate) fn status(&self) -> reqwest::StatusCode {
+        self.response.status()
+    }
+
+    pub(crate) fn text(self) -> impl Future<Output = Result<String>> {
+        async move {
+            let text = trace("response_body", async { Ok(self.response.text().await?) }).await?;
+            tracing::info!(target: TARGET, response_bytes = text.len(), "HTTP response body read");
+            Ok(text)
+        }
+        .instrument(self.span)
+    }
+}
+
+pub(crate) fn window_start(since_utc: &str) {
+    tracing::info!(target: TARGET, window_start = since_utc, "full fetch lower bound");
+}
+
+pub(crate) fn event_count(count: usize) {
+    tracing::info!(target: TARGET, event_count = count, "CalDAV events fetched");
+}
+
+#[cfg(test)]
+mod tests;
