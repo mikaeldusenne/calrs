@@ -62,47 +62,49 @@ impl Drop for Progress {
 }
 
 /// Time a phase and keep its span attached across awaits and cancellation.
-pub(crate) async fn trace<T>(
+/// Box each phase so nested instrumentation does not grow the caller's future/stack.
+pub(crate) fn trace<T>(
     stage: &'static str,
     future: impl Future<Output = Result<T>>,
-) -> Result<T> {
-    async {
-        let mut progress = Progress {
-            started: Instant::now(),
-            span: Span::current(),
-            finished: false,
-        };
-        tracing::info!(target: TARGET, "sync step started");
-        let result = future.await;
-        progress.finished = true;
-        let elapsed_ms = progress.started.elapsed().as_millis() as u64;
-        match &result {
-            Ok(_) => {
-                tracing::info!(target: TARGET, outcome = "ok", elapsed_ms, "sync step finished")
+) -> impl Future<Output = Result<T>> {
+    Box::pin(
+        async move {
+            let mut progress = Progress {
+                started: Instant::now(),
+                span: Span::current(),
+                finished: false,
+            };
+            tracing::info!(target: TARGET, "sync step started");
+            let result = future.await;
+            progress.finished = true;
+            let elapsed_ms = progress.started.elapsed().as_millis() as u64;
+            match &result {
+                Ok(_) => {
+                    tracing::info!(target: TARGET, outcome = "ok", elapsed_ms, "sync step finished")
+                }
+                Err(error) => {
+                    let http_status = error
+                        .downcast_ref::<reqwest::Error>()
+                        .and_then(|e| e.status())
+                        .or_else(|| error.downcast_ref::<HttpStatus>().map(|e| e.0))
+                        .map(|status| status.as_u16());
+                    let io_kind = error
+                        .chain()
+                        .find_map(|cause| cause.downcast_ref::<std::io::Error>().map(|e| e.kind()));
+                    tracing::warn!(target: TARGET,
+                        outcome = "error",
+                        elapsed_ms,
+                        error_kind = error_kind(error),
+                        http_status,
+                        ?io_kind,
+                        "sync step failed"
+                    );
+                }
             }
-            Err(error) => {
-                let http_status = error
-                    .downcast_ref::<reqwest::Error>()
-                    .and_then(|e| e.status())
-                    .or_else(|| error.downcast_ref::<HttpStatus>().map(|e| e.0))
-                    .map(|status| status.as_u16());
-                let io_kind = error
-                    .chain()
-                    .find_map(|cause| cause.downcast_ref::<std::io::Error>().map(|e| e.kind()));
-                tracing::warn!(target: TARGET,
-                    outcome = "error",
-                    elapsed_ms,
-                    error_kind = error_kind(error),
-                    http_status,
-                    ?io_kind,
-                    "sync step failed"
-                );
-            }
+            result
         }
-        result
-    }
-    .instrument(tracing::info_span!("sync_step", stage))
-    .await
+        .instrument(tracing::info_span!("sync_step", stage)),
+    )
 }
 
 #[cfg(test)]
