@@ -177,6 +177,7 @@ pub async fn get_valid_access_token(
 }
 
 /// Build a CaldavClient for a source, handling both basic and OAuth2 auth.
+#[tracing::instrument(skip_all, fields(source_id = source_id))]
 pub async fn build_client_for_source(
     pool: &SqlitePool,
     key: &[u8; 32],
@@ -188,21 +189,24 @@ pub async fn build_client_for_source(
     access_token_enc: Option<&str>,
     token_expires_at: Option<&str>,
 ) -> Result<crate::caldav::CaldavClient> {
-    match auth_type {
-        "oauth2" => {
-            let enc = access_token_enc
-                .ok_or_else(|| anyhow::anyhow!("OAuth2 source missing access token"))?;
-            let access_token =
-                get_valid_access_token(pool, key, source_id, enc, token_expires_at).await?;
-            Ok(crate::caldav::CaldavClient::with_bearer(url, &access_token))
+    crate::caldav::diagnostics::trace("build_client", async {
+        match auth_type {
+            "oauth2" => {
+                let enc = access_token_enc
+                    .ok_or_else(|| anyhow::anyhow!("OAuth2 source missing access token"))?;
+                let access_token =
+                    get_valid_access_token(pool, key, source_id, enc, token_expires_at).await?;
+                Ok(crate::caldav::CaldavClient::with_bearer(url, &access_token))
+            }
+            _ => {
+                let enc = password_enc
+                    .ok_or_else(|| anyhow::anyhow!("Basic auth source missing password"))?;
+                let password = crate::crypto::decrypt_password(key, enc)?;
+                Ok(crate::caldav::CaldavClient::new(url, username, &password))
+            }
         }
-        _ => {
-            let enc = password_enc
-                .ok_or_else(|| anyhow::anyhow!("Basic auth source missing password"))?;
-            let password = crate::crypto::decrypt_password(key, enc)?;
-            Ok(crate::caldav::CaldavClient::new(url, username, &password))
-        }
-    }
+    })
+    .await
 }
 
 /// The Google CalDAV base URL.

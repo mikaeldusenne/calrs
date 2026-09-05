@@ -7,6 +7,7 @@ use std::sync::{Arc, OnceLock};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+use crate::caldav::diagnostics::trace;
 use crate::caldav::{CaldavClient, RawEvent};
 use crate::providers::{factory::kinds, RawEvent as ProviderRawEvent};
 use crate::utils::{extract_vevent_field, extract_vevent_tzid, split_vevents};
@@ -27,11 +28,7 @@ fn parse_full_fetch_lookback_days(value: Option<&str>) -> i64 {
 }
 
 fn full_fetch_lookback_days() -> i64 {
-    parse_full_fetch_lookback_days(
-        std::env::var("CALRS_SYNC_LOOKBACK_DAYS")
-            .ok()
-            .as_deref(),
-    )
+    parse_full_fetch_lookback_days(std::env::var("CALRS_SYNC_LOOKBACK_DAYS").ok().as_deref())
 }
 
 /// Per-source async mutexes used by `sync_if_stale` to dedupe in-flight
@@ -53,6 +50,7 @@ pub(crate) async fn source_lock(source_id: &str) -> Arc<Mutex<()>> {
         .clone()
 }
 
+#[tracing::instrument(skip_all, fields(trigger = "cli", full = full))]
 pub async fn run(pool: &SqlitePool, key: &[u8; 32], full: bool) -> Result<()> {
     let sources: Vec<(String, String, String, String, Option<String>, String, Option<String>, Option<String>, String)> = sqlx::query_as(
         "SELECT id, name, url, username, password_enc, auth_type, access_token_enc, token_expires_at, provider_type FROM caldav_sources WHERE enabled = 1",
@@ -137,193 +135,157 @@ pub async fn run(pool: &SqlitePool, key: &[u8; 32], full: bool) -> Result<()> {
     Ok(())
 }
 
-/// Sync a single CalDAV source: discover calendars and fetch events.
-/// Uses ctag comparison to skip unchanged calendars.
-/// Uses sync-token (RFC 6578) for delta sync when available, with fallback to full fetch.
+/// Sync one CalDAV source. A failed calendar must not advance source freshness.
+#[tracing::instrument(name = "calendar_sync", skip_all, fields(
+    sync_id = %Uuid::new_v4(), source_id = source_id
+))]
 pub async fn sync_source(
     pool: &SqlitePool,
     key: &[u8; 32],
     client: &CaldavClient,
     source_id: &str,
 ) -> Result<()> {
-    let principal = client.discover_principal().await?;
-    let calendar_home = client.discover_calendar_home(&principal).await?;
-    let calendars = client.list_calendars(&calendar_home).await?;
+    trace("sync", async {
+        let principal = trace("discover_principal", client.discover_principal()).await?;
+        let calendar_home = trace(
+            "discover_calendar_home",
+            client.discover_calendar_home(&principal),
+        ).await?;
+        let calendars = trace("list_calendars", client.list_calendars(&calendar_home)).await?;
+        tracing::info!(target: crate::caldav::diagnostics::TARGET, calendar_count = calendars.len(), "calendar discovery finished");
+        let mut did_full_sync = false;
+        let mut failed = 0;
+        for calendar in &calendars {
+            match sync_calendar(pool, key, client, source_id, calendar).await {
+                Ok(full) => did_full_sync |= full,
+                Err(_) => failed += 1, // The calendar span already logged the safe error category.
+            }
+        }
+        if failed > 0 {
+            tracing::warn!(target: crate::caldav::diagnostics::TARGET,
+                failed_calendars = failed, calendar_count = calendars.len(),
+                "source sync incomplete; freshness timestamps preserved"
+            );
+            anyhow::bail!("Sync incomplete: {failed} calendar(s) failed; see sync diagnostics");
+        }
 
-    let mut did_full_sync = false;
+        trace("reconcile_bookings", async {
+            cancel_orphaned_bookings(pool, key, Some(client), source_id).await;
+            Ok(())
+        }).await?;
+        trace("save_source_state", async {
+            sqlx::query(
+                "UPDATE caldav_sources SET last_synced = datetime('now'),
+                 last_full_sync = CASE WHEN ? THEN datetime('now') ELSE last_full_sync END
+                 WHERE id = ?",
+            )
+            .bind(did_full_sync)
+            .bind(source_id)
+            .execute(pool)
+            .await?;
+            Ok(())
+        }).await?;
+        Ok(())
+    }).await
+}
 
-    for cal_info in &calendars {
-        // Upsert calendar and get stored state
-        let (cal_id, stored_ctag, stored_sync_token) =
-            upsert_calendar(pool, source_id, cal_info).await?;
-
-        let cal_label = cal_info.display_name.as_deref().unwrap_or(&cal_info.href);
-
-        // ctag comparison: skip if unchanged
-        if let (Some(remote), Some(local)) = (&cal_info.ctag, &stored_ctag) {
+/// Return whether this calendar required a full fetch.
+#[tracing::instrument(skip_all, fields(calendar_id = tracing::field::Empty))]
+async fn sync_calendar(
+    pool: &SqlitePool,
+    key: &[u8; 32],
+    client: &CaldavClient,
+    source_id: &str,
+    calendar: &crate::caldav::CalendarInfo,
+) -> Result<bool> {
+    let calendar_span = tracing::Span::current();
+    trace("calendar", async {
+        let (cal_id, ctag, token) = trace(
+            "save_calendar", upsert_calendar(pool, source_id, calendar),
+        ).await?;
+        calendar_span.record("calendar_id", &cal_id);
+        if let (Some(remote), Some(local)) = (&calendar.ctag, &ctag) {
             if remote == local {
-                tracing::debug!(calendar = %cal_label, "ctag unchanged, skipping");
-                println!("  {} {} — unchanged", "✓".green(), cal_label);
-                continue;
+                tracing::info!(target: crate::caldav::diagnostics::TARGET, mode = "unchanged", "calendar sync skipped");
+                return Ok(false);
             }
         }
 
-        // Try sync-token delta if we have one stored
-        let delta_ok = if let Some(token) = &stored_sync_token {
-            match client.sync_collection(&cal_info.href, Some(token)).await {
-                Ok(result) => {
-                    // If ctag changed but sync-collection reports nothing, the server's
-                    // sync-token implementation is incomplete (e.g. BlueMind doesn't report
-                    // deletions). Fall through to full sync to catch the changes.
-                    if result.changed.is_empty() && result.deleted_hrefs.is_empty() {
-                        tracing::info!(
-                            calendar = %cal_label,
-                            "ctag changed but sync-collection returned empty delta, falling back to full sync"
-                        );
-                        false
-                    } else {
-                        let changed = upsert_raw_events(pool, &cal_id, &result.changed).await;
-                        let deleted = delete_events_by_href(
-                            pool,
-                            key,
-                            Some(client),
-                            source_id,
-                            &cal_id,
-                            &result.deleted_hrefs,
-                        )
-                        .await;
-
-                        // Store new sync-token and ctag
-                        update_calendar_sync_state(
-                            pool,
-                            &cal_id,
-                            &cal_info.ctag,
-                            &result.new_sync_token,
-                        )
-                        .await;
-
-                        tracing::info!(
-                            calendar = %cal_label,
-                            changed = changed,
-                            deleted = deleted,
-                            "delta sync completed"
-                        );
-                        println!(
-                            "  {} {} — {} changed, {} deleted (delta)",
-                            "✓".green(),
-                            cal_label,
-                            changed,
-                            deleted
-                        );
-                        true
-                    }
+        if let Some(token) = &token {
+            match trace("delta", client.sync_collection(&calendar.href, Some(token))).await {
+                Ok(result) if !result.changed.is_empty() || !result.deleted_hrefs.is_empty() => {
+                    let changed = trace(
+                        "save_events", upsert_raw_events(pool, &cal_id, &result.changed),
+                    ).await?;
+                    let deleted = trace("reconcile_delta", async {
+                        Ok(delete_events_by_href(
+                            pool, key, Some(client), source_id, &cal_id, &result.deleted_hrefs,
+                        ).await)
+                    }).await?;
+                    trace("save_calendar_state", update_calendar_sync_state(
+                        pool, &cal_id, &calendar.ctag, &result.new_sync_token,
+                    )).await?;
+                    tracing::info!(target: crate::caldav::diagnostics::TARGET, changed, deleted, mode = "delta", "calendar sync finished");
+                    return Ok(false);
                 }
-                Err(e) => {
-                    tracing::info!(
-                        calendar = %cal_label,
-                        error = %e,
-                        "sync-token delta failed, falling back to full sync"
-                    );
-                    false
-                }
+                Ok(_) => tracing::info!(target: crate::caldav::diagnostics::TARGET,
+                    fallback = "time_range", reason = "empty_delta",
+                    "ctag changed but delta was empty"
+                ),
+                Err(_) => tracing::warn!(target: crate::caldav::diagnostics::TARGET,
+                    fallback = "time_range", reason = "delta_failed",
+                    "delta failed; trying a full fetch"
+                ),
             }
+        }
+
+        let lookback_days = full_fetch_lookback_days();
+        let since_dt = Utc::now()
+            .checked_sub_signed(chrono::Duration::days(lookback_days))
+            .ok_or_else(|| anyhow::anyhow!("Sync lookback exceeds the supported date range"))?;
+        let since_iso = since_dt.format("%Y%m%dT%H%M%SZ").to_string();
+        let since_prefix = since_dt.format("%Y%m%d").to_string();
+        tracing::info!(target: crate::caldav::diagnostics::TARGET,
+            lookback_days, window_start = %since_iso, window_end = "unbounded",
+            "full sync window"
+        );
+        let raw_events = trace(
+            "fetch_events", client.fetch_events_since(&calendar.href, &since_iso),
+        ).await?;
+        let count = trace("save_events", upsert_raw_events(pool, &cal_id, &raw_events)).await?;
+        let deleted = trace("reconcile_events", async {
+            Ok(remove_orphaned_events(
+                pool, key, Some(client), source_id, &cal_id, &raw_events, &since_prefix,
+            ).await)
+        }).await?;
+
+        let new_token = if calendar.sync_token.is_some() {
+            calendar.sync_token.clone()
         } else {
-            false
-        };
-
-        if !delta_ok {
-            did_full_sync = true;
-            // Full fetch fallback. Bounded with a `time-range` filter so Google
-            // CalDAV returns future events (its unfiltered REPORT truncates the
-            // forward window). fetch_events_since falls back to the unfiltered
-            // REPORT if the server rejects time-range, so other servers are
-            // unaffected.
-            let since_dt = Utc::now() - chrono::Duration::days(full_fetch_lookback_days());
-            let since_iso = since_dt.format("%Y%m%dT%H%M%SZ").to_string();
-            let since_prefix = since_dt.format("%Y%m%d").to_string();
-            match client.fetch_events_since(&cal_info.href, &since_iso).await {
-                Ok(raw_events) => {
-                    let count = upsert_raw_events(pool, &cal_id, &raw_events).await;
-
-                    // Remove events that no longer exist on the server, but only
-                    // within the fetched window. Older events weren't in the
-                    // response by design and must not be treated as orphans.
-                    let deleted = remove_orphaned_events(
-                        pool,
-                        key,
-                        Some(client),
-                        source_id,
-                        &cal_id,
-                        &raw_events,
-                        &since_prefix,
-                    )
-                    .await;
-                    if deleted > 0 {
-                        tracing::info!(
-                            calendar_name = cal_label,
-                            stale_events_removed = deleted,
-                            "removed stale events from local cache"
-                        );
-                    }
-
-                    // Store sync-token from PROPFIND (if server provided one) or try to get one
-                    let new_token = if cal_info.sync_token.is_some() {
-                        cal_info.sync_token.clone()
-                    } else {
-                        // Try an empty sync-collection to get initial token
-                        client
-                            .sync_collection(&cal_info.href, None)
-                            .await
-                            .ok()
-                            .and_then(|r| r.new_sync_token)
-                    };
-                    update_calendar_sync_state(pool, &cal_id, &cal_info.ctag, &new_token).await;
-
-                    println!(
-                        "  {} {} — {} event(s) synced{}",
-                        "✓".green(),
-                        cal_label,
-                        count,
-                        if deleted > 0 {
-                            format!(", {} removed", deleted)
-                        } else {
-                            String::new()
-                        }
-                    );
-                }
-                Err(e) => {
-                    println!("  {} {} — failed: {}", "✗".red(), cal_label, e);
+            // An empty token requests initial synchronization, potentially including all events.
+            tracing::info!(target: crate::caldav::diagnostics::TARGET,
+                time_filtered = false, "initial sync-token request may retrieve the whole calendar"
+            );
+            match trace("initial_token", client.sync_collection(&calendar.href, None)).await {
+                Ok(result) => result.new_sync_token,
+                Err(_) => {
+                    tracing::warn!(target: crate::caldav::diagnostics::TARGET, "initial token unavailable; fetched events are kept");
+                    None
                 }
             }
-        }
-    }
-
-    // Cancel any active bookings whose CalDAV event no longer exists.
-    // This catches bookings orphaned before the cancellation code was deployed,
-    // or edge cases where the event was deleted in a previous sync cycle.
-    cancel_orphaned_bookings(pool, key, Some(client), source_id).await;
-
-    // Update last_synced (and last_full_sync if we did a full fetch)
-    if did_full_sync {
-        let _ =
-            sqlx::query("UPDATE caldav_sources SET last_full_sync = datetime('now') WHERE id = ?")
-                .bind(source_id)
-                .execute(pool)
-                .await;
-    }
-    sqlx::query("UPDATE caldav_sources SET last_synced = datetime('now') WHERE id = ?")
-        .bind(source_id)
-        .execute(pool)
-        .await?;
-
-    tracing::info!(source_id = %source_id, "CalDAV sync completed");
-
-    Ok(())
+        };
+        trace("save_calendar_state", update_calendar_sync_state(
+            pool, &cal_id, &calendar.ctag, &new_token,
+        )).await?;
+        tracing::info!(target: crate::caldav::diagnostics::TARGET, event_count = count, deleted, mode = "full", "calendar sync finished");
+        Ok(true)
+    }).await
 }
 
 /// Sync calendars for a user if any of their sources are stale (last_synced > STALE_SECS ago).
 /// Uses sync-token delta when available, with fallback to full fetch.
 /// Silently skips on errors (best-effort for guest-facing pages).
+#[tracing::instrument(skip_all, fields(trigger = "on_demand"))]
 pub async fn sync_if_stale(pool: &SqlitePool, key: &[u8; 32], user_id: &str) {
     let cutoff = Utc::now() - chrono::Duration::seconds(STALE_SECS);
     // Must match SQLite datetime('now') format: "YYYY-MM-DD HH:MM:SS" (space, not T)
@@ -363,7 +325,7 @@ pub async fn sync_if_stale(pool: &SqlitePool, key: &[u8; 32], user_id: &str) {
         // syncing this source, we wait, then re-check staleness — almost
         // always the winner bumped last_synced and we can skip.
         let lock = source_lock(source_id).await;
-        let _guard = lock.lock().await;
+        let _guard = trace("wait_for_source_lock", async { Ok(lock.lock().await) }).await;
 
         let last_synced: Option<String> = sqlx::query_scalar::<_, Option<String>>(
             "SELECT last_synced FROM caldav_sources WHERE id = ?",
@@ -421,6 +383,7 @@ pub async fn sync_if_stale(pool: &SqlitePool, key: &[u8; 32], user_id: &str) {
 
 /// Sync a single source by ID (for background sync loop).
 /// Forces a full resync if last_full_sync is >24h ago (catches orphaned events).
+#[tracing::instrument(skip_all, fields(trigger = "background", source_id = source_id))]
 pub async fn sync_source_by_id(pool: &SqlitePool, key: &[u8; 32], source_id: &str) {
     let source: Option<(String, String, Option<String>, Option<String>, String, Option<String>, Option<String>, String)> = sqlx::query_as(
         "SELECT url, username, password_enc, last_full_sync, auth_type, access_token_enc, token_expires_at, provider_type FROM caldav_sources WHERE id = ? AND enabled = 1",
@@ -777,14 +740,14 @@ async fn upsert_calendar(
         None => {
             let id = Uuid::new_v4().to_string();
             sqlx::query(
-                "INSERT INTO calendars (id, source_id, href, display_name, color, ctag) VALUES (?, ?, ?, ?, ?, ?)",
+                // Only save ctag after events have been fetched successfully.
+                "INSERT INTO calendars (id, source_id, href, display_name, color) VALUES (?, ?, ?, ?, ?)",
             )
             .bind(&id)
             .bind(source_id)
             .bind(&cal_info.href)
             .bind(&cal_info.display_name)
             .bind(&cal_info.color)
-            .bind(&cal_info.ctag)
             .execute(pool)
             .await?;
             Ok((id, None, None))
@@ -793,7 +756,11 @@ async fn upsert_calendar(
 }
 
 /// Upsert events from raw CalDAV data. Returns count of events processed.
-async fn upsert_raw_events(pool: &SqlitePool, cal_id: &str, raw_events: &[RawEvent]) -> u32 {
+async fn upsert_raw_events(
+    pool: &SqlitePool,
+    cal_id: &str,
+    raw_events: &[RawEvent],
+) -> Result<u32> {
     let mut count = 0u32;
     for raw in raw_events {
         let vevent_blocks = split_vevents(&raw.ical_data);
@@ -812,7 +779,7 @@ async fn upsert_raw_events(pool: &SqlitePool, cal_id: &str, raw_events: &[RawEve
             let timezone = extract_vevent_tzid(vevent, "DTSTART");
 
             let event_id = Uuid::new_v4().to_string();
-            let _ = sqlx::query(
+            sqlx::query(
                 "INSERT INTO events (id, calendar_id, uid, summary, start_at, end_at, location, description, status, rrule, raw_ical, recurrence_id, timezone, transp)
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                  ON CONFLICT(calendar_id, uid, COALESCE(recurrence_id, '')) DO UPDATE SET
@@ -844,12 +811,12 @@ async fn upsert_raw_events(pool: &SqlitePool, cal_id: &str, raw_events: &[RawEve
             .bind(&timezone)
             .bind(&transp)
             .execute(pool)
-            .await;
+            .await?;
 
             count += 1;
         }
     }
-    count
+    Ok(count)
 }
 
 /// Delete events by their CalDAV href (used for sync-collection 404 deletions).
@@ -1213,13 +1180,14 @@ async fn update_calendar_sync_state(
     cal_id: &str,
     ctag: &Option<String>,
     sync_token: &Option<String>,
-) {
-    let _ = sqlx::query("UPDATE calendars SET ctag = ?, sync_token = ? WHERE id = ?")
+) -> Result<()> {
+    sqlx::query("UPDATE calendars SET ctag = ?, sync_token = ? WHERE id = ?")
         .bind(ctag)
         .bind(sync_token)
         .bind(cal_id)
         .execute(pool)
-        .await;
+        .await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1249,6 +1217,87 @@ mod tests {
             .unwrap();
         crate::db::migrate(&pool).await.unwrap();
         pool
+    }
+
+    /// A failed fetch (including its fallback) must be retried with the same remote ctag.
+    #[tokio::test]
+    async fn failed_full_sync_preserves_freshness_and_retries_new_calendar() {
+        use axum::{extract::Request, http::StatusCode, routing::any, Router};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let failing = Arc::new(AtomicBool::new(true));
+        let state = failing.clone();
+        let app = Router::new().fallback(any(move |request: Request| {
+            let failing = state.load(Ordering::SeqCst);
+            async move {
+                let body = match request.uri().path() {
+                    "/" => "<d:current-user-principal><d:href>/principal</d:href></d:current-user-principal>",
+                    "/principal" => "<cal:calendar-home-set><d:href>/home</d:href></cal:calendar-home-set>",
+                    "/home" => "<d:multistatus><d:response><d:href>/cal/</d:href><d:propstat><d:prop><d:resourcetype><cal:calendar/></d:resourcetype><cs:getctag>unchanged-remote-tag</cs:getctag><d:sync-token>initial-token</d:sync-token></d:prop></d:propstat></d:response></d:multistatus>",
+                    _ if failing => return (StatusCode::GATEWAY_TIMEOUT, "upstream unavailable"),
+                    _ => "<d:multistatus/>",
+                };
+                (StatusCode::MULTI_STATUS, body)
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let pool = setup_test_db().await;
+        let (source_id, _) = seed_fixtures(&pool).await;
+        sqlx::query("UPDATE caldav_sources SET last_synced = '2000-01-01', last_full_sync = '2000-01-01' WHERE id = ?")
+            .bind(&source_id).execute(&pool).await.unwrap();
+        let client = CaldavClient::new(&url, "user", "password");
+        let key = [0; 32];
+
+        assert!(sync_source(&pool, &key, &client, &source_id).await.is_err());
+        let times: (String, String) =
+            sqlx::query_as("SELECT last_synced, last_full_sync FROM caldav_sources WHERE id = ?")
+                .bind(&source_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(times, ("2000-01-01".into(), "2000-01-01".into()));
+        let ctag: Option<String> =
+            sqlx::query_scalar("SELECT ctag FROM calendars WHERE source_id = ?")
+                .bind(&source_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            ctag.is_none(),
+            "a failed first fetch must not mark the calendar unchanged"
+        );
+
+        failing.store(false, Ordering::SeqCst);
+        sync_source(&pool, &key, &client, &source_id).await.unwrap();
+        let last_full: String =
+            sqlx::query_scalar("SELECT last_full_sync FROM caldav_sources WHERE id = ?")
+                .bind(&source_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_ne!(last_full, "2000-01-01");
+        let ctag: String = sqlx::query_scalar("SELECT ctag FROM calendars WHERE source_id = ?")
+            .bind(&source_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(ctag, "unchanged-remote-tag");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn event_cache_write_failure_is_not_reported_as_success() {
+        let pool = setup_test_db().await;
+        let event = RawEvent {
+            href: "/cal/test.ics".into(),
+            ical_data: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:test\r\nDTSTART:20300101T120000Z\r\nEND:VEVENT\r\nEND:VCALENDAR".into(),
+        };
+        let error = upsert_raw_events(&pool, "nonexistent-calendar", &[event])
+            .await
+            .unwrap_err();
+        assert_eq!(crate::caldav::diagnostics::error_kind(&error), "database");
     }
 
     /// Seed the minimum fixtures needed to exercise the orphan sweep:

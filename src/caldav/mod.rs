@@ -3,6 +3,11 @@ use reqwest::{Client, RequestBuilder};
 use std::net::IpAddr;
 use std::time::Duration;
 
+pub(crate) mod diagnostics;
+
+const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
+const REPORT_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Host portion of Google's CalDAV API. Used to short-circuit the discovery
 /// flow, since Google's PROPFIND responses don't follow RFC 4791 closely
 /// enough for the standard discovery to work, and the URL pattern is fixed.
@@ -154,7 +159,7 @@ impl CaldavClient {
 
     fn build(base_url: &str, auth: CaldavAuth) -> Self {
         let client = Client::builder()
-            .timeout(Duration::from_secs(10))
+            .timeout(DISCOVERY_TIMEOUT)
             .build()
             .unwrap_or_else(|_| Client::new());
 
@@ -192,32 +197,53 @@ impl CaldavClient {
         }
     }
 
-    /// Send a PROPFIND request and return the response body
+    /// Trace headers and body separately; log metadata only, including HTTP failures.
+    #[tracing::instrument(skip_all, fields(
+        request_id = %uuid::Uuid::new_v4(), method = method, request_kind = request_kind,
+        timeout_ms = timeout.as_millis() as u64
+    ))]
+    async fn read_response(
+        &self,
+        request: RequestBuilder,
+        method: &'static str,
+        request_kind: &'static str,
+        timeout: Duration,
+    ) -> Result<(reqwest::StatusCode, String)> {
+        diagnostics::trace("http_request", async {
+            let response = diagnostics::trace("response_headers", async {
+                Ok(request.timeout(timeout).send().await?)
+            })
+            .await?;
+            let status = response.status();
+            tracing::info!(target: crate::caldav::diagnostics::TARGET, http_status = status.as_u16(), "HTTP response headers received");
+            // Keep reqwest's charset decoding, but never log the decoded text.
+            let text = diagnostics::trace("response_body", async { Ok(response.text().await?) })
+                .await?;
+            tracing::info!(target: crate::caldav::diagnostics::TARGET, response_bytes = text.len(), "HTTP response body read");
+            Ok((status, text))
+        })
+        .await
+    }
+
+    /// Send a PROPFIND request and return the response body.
     async fn propfind(&self, url: &str, depth: &str, body: &str) -> Result<String> {
-        tracing::debug!(url = %url, depth = %depth, "sending PROPFIND request");
         let req = self
             .client
             .request(reqwest::Method::from_bytes(b"PROPFIND")?, url);
-        let resp = self
+        let request = self
             .apply_auth(req)
             .header("Content-Type", "application/xml; charset=utf-8")
             .header("Depth", depth)
-            .body(body.to_string())
-            .send()
+            .body(body.to_string());
+        let (status, text) = self
+            .read_response(request, "PROPFIND", "discovery", DISCOVERY_TIMEOUT)
             .await?;
 
-        let status = resp.status();
-        tracing::debug!(url = %url, status = %status, "PROPFIND response received");
-
         if !status.is_success() && status.as_u16() != 207 {
-            // Surface the response body. Servers like Google embed the actual reason
-            // (insufficient scope, API not enabled, etc.) in the body, not the status line.
-            let body = resp.text().await.unwrap_or_default();
-            let snippet: String = body.chars().take(500).collect();
-            bail!("PROPFIND {} returned {}: {}", url, status, snippet);
+            return Err(diagnostics::HttpStatus(status).into());
         }
 
-        Ok(resp.text().await?)
+        Ok(text)
     }
 
     /// Check if the server supports CalDAV.
@@ -269,7 +295,7 @@ impl CaldavClient {
         // OAuth2 sources is already the per-user principal endpoint, so skip the
         // round-trip and return it directly.
         if self.base_url.contains(GOOGLE_CALDAV_HOST) {
-            tracing::debug!(principal = %self.base_url, "using Google CalDAV principal URL directly");
+            tracing::debug!("using Google CalDAV principal URL directly");
             return Ok(self.base_url.clone());
         }
 
@@ -286,12 +312,15 @@ impl CaldavClient {
         // Uses namespace-agnostic search to handle any prefix (d:, D:, or arbitrary like a:)
         if let Some(inner) = extract_tag(&text, "d:current-user-principal") {
             if let Some(href) = extract_tag(&inner, "d:href") {
-                tracing::debug!(principal = %href, "discovered principal URL");
+                tracing::debug!("discovered principal URL");
                 return Ok(href);
             }
         }
 
-        tracing::debug!(response_body = %text, "failed to parse principal from response");
+        tracing::debug!(
+            response_bytes = text.len(),
+            "failed to parse principal from response"
+        );
         bail!("Could not discover principal URL from response")
     }
 
@@ -309,12 +338,15 @@ impl CaldavClient {
         // Uses namespace-agnostic search to handle any prefix (cal:, C:, or arbitrary like a:)
         if let Some(inner) = extract_tag(&text, "cal:calendar-home-set") {
             if let Some(href) = extract_tag(&inner, "d:href") {
-                tracing::debug!(calendar_home = %href, "discovered calendar-home-set");
+                tracing::debug!("discovered calendar-home-set");
                 return Ok(href);
             }
         }
 
-        tracing::debug!(response_body = %text, "failed to parse calendar-home-set from response");
+        tracing::debug!(
+            response_bytes = text.len(),
+            "failed to parse calendar-home-set from response"
+        );
         bail!("Could not discover calendar-home-set from response")
     }
 
@@ -329,7 +361,10 @@ impl CaldavClient {
             "listed calendars"
         );
         if calendars.is_empty() && !text.is_empty() {
-            tracing::debug!(response_body = %text, "no calendars parsed from response");
+            tracing::debug!(
+                response_bytes = text.len(),
+                "no calendars parsed from response"
+            );
         }
         Ok(calendars)
     }
@@ -439,18 +474,23 @@ impl CaldavClient {
         let req = self
             .client
             .request(reqwest::Method::from_bytes(b"REPORT")?, &url);
-        let resp = self
+        let request = self
             .apply_auth(req)
             .header("Content-Type", "application/xml; charset=utf-8")
             .header("Depth", "1")
-            .timeout(Duration::from_secs(60))
-            .body(REPORT_CALENDAR_DATA)
-            .send()
+            .body(REPORT_CALENDAR_DATA);
+        let (status, text) = self
+            .read_response(request, "REPORT", "unfiltered", REPORT_TIMEOUT)
             .await?;
-
-        let text = resp.text().await?;
-        let events = parse_event_responses(&text);
-        Ok(events)
+        if !status.is_success() {
+            return Err(diagnostics::HttpStatus(status).into());
+        }
+        diagnostics::trace("parse_events", async {
+            let events = parse_event_responses(&text);
+            tracing::info!(target: crate::caldav::diagnostics::TARGET, event_count = events.len(), "CalDAV events parsed");
+            Ok(events)
+        })
+        .await
     }
 
     /// Perform a sync-collection REPORT (RFC 6578) to get changes since a sync-token.
@@ -479,25 +519,35 @@ impl CaldavClient {
         let req = self
             .client
             .request(reqwest::Method::from_bytes(b"REPORT")?, &url);
-        let resp = self
+        let request = self
             .apply_auth(req)
             .header("Content-Type", "application/xml; charset=utf-8")
-            .timeout(Duration::from_secs(60))
-            .body(body)
-            .send()
+            .body(body);
+        let request_kind = if sync_token.is_some() {
+            "delta"
+        } else {
+            "initial_token"
+        };
+        let (status, text) = self
+            .read_response(request, "REPORT", request_kind, REPORT_TIMEOUT)
             .await?;
-
-        let status = resp.status();
         // 403/412 = token expired or invalid; 405 = not supported
         if status.as_u16() == 403 || status.as_u16() == 412 || status.as_u16() == 405 {
-            bail!("sync-token invalid or not supported (HTTP {})", status);
+            return Err(diagnostics::HttpStatus(status).into());
         }
         if !status.is_success() && status.as_u16() != 207 {
-            bail!("sync-collection REPORT returned {}", status);
+            return Err(diagnostics::HttpStatus(status).into());
         }
 
-        let text = resp.text().await?;
-        Ok(parse_sync_response(&text))
+        diagnostics::trace("parse_delta", async {
+            let result = parse_sync_response(&text);
+            tracing::info!(target: crate::caldav::diagnostics::TARGET,
+                changed = result.changed.len(), deleted = result.deleted_hrefs.len(),
+                token_received = result.new_sync_token.is_some(), "CalDAV delta parsed"
+            );
+            Ok(result)
+        })
+        .await
     }
 
     /// Fetch events from a calendar starting from a given UTC datetime.
@@ -531,25 +581,31 @@ impl CaldavClient {
         let req = self
             .client
             .request(reqwest::Method::from_bytes(b"REPORT")?, &url);
-        let resp = self
+        let request = self
             .apply_auth(req)
             .header("Content-Type", "application/xml; charset=utf-8")
             .header("Depth", "1")
-            .timeout(Duration::from_secs(60))
-            .body(body)
-            .send()
+            .body(body);
+        tracing::info!(target: crate::caldav::diagnostics::TARGET, window_start = since_utc, "requesting time-filtered CalDAV events");
+        let (status, text) = self
+            .read_response(request, "REPORT", "time_range", REPORT_TIMEOUT)
             .await?;
-
-        let status = resp.status();
-        let text = resp.text().await?;
 
         // If the server doesn't support time-range, fall back to full fetch
         if !status.is_success() {
+            tracing::warn!(target: crate::caldav::diagnostics::TARGET,
+                http_status = status.as_u16(), fallback = "unfiltered",
+                "time-range REPORT rejected; retrying without a time filter"
+            );
             return self.fetch_events(calendar_href).await;
         }
 
-        let events = parse_event_responses(&text);
-        Ok(events)
+        diagnostics::trace("parse_events", async {
+            let events = parse_event_responses(&text);
+            tracing::info!(target: crate::caldav::diagnostics::TARGET, event_count = events.len(), "CalDAV events parsed");
+            Ok(events)
+        })
+        .await
     }
 }
 
@@ -950,6 +1006,42 @@ const REPORT_CALENDAR_DATA: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Headers may arrive before a large calendar body stalls.
+    #[tokio::test]
+    async fn diagnostics_distinguish_body_timeout_from_http_status() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = [0; 4096];
+            stream.read(&mut buffer).await.unwrap();
+            stream
+                .write_all(b"HTTP/1.1 207 Multi-Status\r\nContent-Length: 1000\r\n\r\n")
+                .await
+                .unwrap();
+            std::future::pending::<()>().await;
+        });
+        let client = CaldavClient::new(&url, "user", "password");
+        let error = client
+            .read_response(
+                client.client.get(&url),
+                "GET",
+                "test",
+                Duration::from_millis(200),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(diagnostics::error_kind(&error), "timeout");
+        assert!(error
+            .downcast_ref::<reqwest::Error>()
+            .unwrap()
+            .status()
+            .is_none());
+        server.abort();
+    }
 
     // --- extract_tag ---
 
