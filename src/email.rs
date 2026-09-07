@@ -2158,8 +2158,6 @@ pub async fn send_test_email(config: &SmtpConfig, to_email: &str) -> Result<()> 
         .subject("calrs \u{2014} SMTP test")
         .multipart(body)?;
 
-    // Debug is only useful when sending a test email
-    tracing::debug!("Sending: {:?}", email);
     send_email(config, email).await
 }
 

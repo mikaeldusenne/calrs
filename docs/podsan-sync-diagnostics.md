@@ -1,5 +1,10 @@
 # PodSaN sync diagnostics
 
+For the minimal operator view, run `./scripts/diagnose-sync.sh` from the
+`calrs-podsan` deployment repository, then click Sync once. It translates the
+existing stages into French and prints only selected metadata. The detailed
+procedure below remains available when individual HTTP requests are needed.
+
 A dashboard HTTP 504 after about ten seconds does not identify which component
 timed out. Observe one sync, including what happens after the browser fails.
 
@@ -42,6 +47,9 @@ each HTTP request. Completion records contain `elapsed_ms`.
 it is unavailable when body reading fails. New logs contain metadata only:
 no URLs, credentials, calendar names, ICS bodies or arbitrary error messages.
 Other existing logs can contain personal data; share only the filtered lines.
+The SMTP test-message dump and raw CalDAV response-body logs/errors have been
+removed. DavMail must also run below DEBUG: its wire/ICS dumps are independent
+of the Cal.rs logging level and are not disabled by `davmail.dumpICS=0` alone.
 
 ## Maintenance boundary and limits
 

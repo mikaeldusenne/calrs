@@ -211,11 +211,9 @@ impl CaldavClient {
         tracing::debug!(url = %url, status = %status, "PROPFIND response received");
 
         if !status.is_success() && status.as_u16() != 207 {
-            // Surface the response body. Servers like Google embed the actual reason
-            // (insufficient scope, API not enabled, etc.) in the body, not the status line.
-            let body = resp.text().await.unwrap_or_default();
-            let snippet: String = body.chars().take(500).collect();
-            bail!("PROPFIND {} returned {}: {}", url, status, snippet);
+            // Errors reach logs and dashboard pages. Never include upstream bodies:
+            // CalDAV responses may contain event descriptions or credentials.
+            bail!("PROPFIND returned HTTP {}", status);
         }
 
         resp.text().await
@@ -292,7 +290,10 @@ impl CaldavClient {
             }
         }
 
-        tracing::debug!(response_body = %text, "failed to parse principal from response");
+        tracing::debug!(
+            response_bytes = text.len(),
+            "failed to parse principal from response"
+        );
         bail!("Could not discover principal URL from response")
     }
 
@@ -315,7 +316,10 @@ impl CaldavClient {
             }
         }
 
-        tracing::debug!(response_body = %text, "failed to parse calendar-home-set from response");
+        tracing::debug!(
+            response_bytes = text.len(),
+            "failed to parse calendar-home-set from response"
+        );
         bail!("Could not discover calendar-home-set from response")
     }
 
@@ -330,7 +334,7 @@ impl CaldavClient {
             "listed calendars"
         );
         if calendars.is_empty() && !text.is_empty() {
-            tracing::debug!(response_body = %text, "no calendars parsed from response");
+            tracing::debug!(response_bytes = text.len(), "no calendars parsed from response");
         }
         Ok(calendars)
     }
@@ -350,8 +354,7 @@ impl CaldavClient {
 
         let status = resp.status();
         if !status.is_success() && status.as_u16() != 201 && status.as_u16() != 204 {
-            let body = resp.text().await.unwrap_or_default();
-            bail!("PUT {} returned {} — {}", url, status, body);
+            bail!("PUT returned HTTP {}", status);
         }
 
         Ok(())
@@ -425,8 +428,7 @@ impl CaldavClient {
 
         let status = resp.status();
         if !status.is_success() && status.as_u16() != 204 && status.as_u16() != 404 {
-            let body = resp.text().await.unwrap_or_default();
-            bail!("DELETE {} returned {} — {}", url, status, body);
+            bail!("DELETE returned HTTP {}", status);
         }
 
         Ok(())
@@ -1620,7 +1622,7 @@ END:VCALENDAR</c:calendar-data>
     // <current-user-principal>, but the URL we configure for Google OAuth2
     // sources is already the per-user principal endpoint, so discover_principal
     // short-circuits and returns it directly. discover_calendar_home then does
-    // a real PROPFIND so any error from Google surfaces with its actual body.
+    // a real PROPFIND so any error from Google surfaces with its HTTP status.
     #[tokio::test]
     async fn google_discover_principal_short_circuits() {
         let url = "https://apidata.googleusercontent.com/caldav/v2/alice%40gmail.com/user";
@@ -1628,6 +1630,36 @@ END:VCALENDAR</c:calendar-data>
 
         let principal = client.discover_principal().await.unwrap();
         assert_eq!(principal, url);
+    }
+
+    #[tokio::test]
+    async fn http_errors_keep_status_without_calendar_contents() {
+        use axum::{http::StatusCode, routing::any, Router};
+
+        let app = Router::new().fallback(any(|| async {
+            (
+                StatusCode::BAD_GATEWAY,
+                "<calendar-data>PRIVATE_EVENT patient@example.com</calendar-data>",
+            )
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = CaldavClient::new(&url, "user", "password");
+
+        let errors = [
+            client.discover_principal().await.unwrap_err(),
+            client.put_event("/calendar", "uid", "event").await.unwrap_err(),
+            client.delete_event("/calendar", "uid").await.unwrap_err(),
+        ];
+        for error in errors {
+            let message = error.to_string();
+            assert!(message.contains("502"), "{message}");
+            for private in ["PRIVATE_EVENT", "patient@example.com", "calendar-data", &url] {
+                assert!(!message.contains(private), "{message}");
+            }
+        }
+        server.abort();
     }
 
     // --- private-host allowlist (SSRF opt-out) ---
