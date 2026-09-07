@@ -334,7 +334,10 @@ impl CaldavClient {
             "listed calendars"
         );
         if calendars.is_empty() && !text.is_empty() {
-            tracing::debug!(response_bytes = text.len(), "no calendars parsed from response");
+            tracing::debug!(
+                response_bytes = text.len(),
+                "no calendars parsed from response"
+            );
         }
         Ok(calendars)
     }
@@ -1649,13 +1652,21 @@ END:VCALENDAR</c:calendar-data>
 
         let errors = [
             client.discover_principal().await.unwrap_err(),
-            client.put_event("/calendar", "uid", "event").await.unwrap_err(),
+            client
+                .put_event("/calendar", "uid", "event")
+                .await
+                .unwrap_err(),
             client.delete_event("/calendar", "uid").await.unwrap_err(),
         ];
         for error in errors {
             let message = error.to_string();
             assert!(message.contains("502"), "{message}");
-            for private in ["PRIVATE_EVENT", "patient@example.com", "calendar-data", &url] {
+            for private in [
+                "PRIVATE_EVENT",
+                "patient@example.com",
+                "calendar-data",
+                &url,
+            ] {
                 assert!(!message.contains(private), "{message}");
             }
         }
