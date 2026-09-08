@@ -165,8 +165,11 @@ async fn list_items_window(
         let total = page.total;
         all.append(&mut page.items);
 
-        // CalendarView returns everything in one shot.
+        // CalendarView cannot be offset-paged. Never publish a truncated view.
         if start_utc.is_some() {
+            if !page.includes_last || included != all.len() {
+                return Err(crate::sync_diagnostics::SyncFailure::new("invalid_response").into());
+            }
             break;
         }
         if included == 0 {

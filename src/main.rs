@@ -22,6 +22,7 @@ mod rrule;
 mod settings;
 mod sms;
 mod sync_diagnostics;
+mod sync_jobs;
 #[cfg(test)]
 mod test_support;
 mod utils;

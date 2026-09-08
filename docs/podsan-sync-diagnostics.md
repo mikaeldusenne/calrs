@@ -1,72 +1,111 @@
-# PodSaN sync diagnostics
+# PodSaN calendar synchronization
 
-For the minimal operator view, run `./scripts/diagnose-sync.sh` from the
-`calrs-podsan` deployment repository, then click Sync once. It translates the
-existing stages into French and prints only selected metadata. The detailed
-procedure below remains available when individual HTTP requests are needed.
+## User workflow
 
-A dashboard HTTP 504 after about ten seconds does not identify which component
-timed out. Observe one sync, including what happens after the browser fails.
+After deploying this change, **Sync** immediately redirects to an authenticated
+status page. It refreshes every two seconds while queued/running. Closing the
+browser does not cancel the job. Repeated clicks join the same active attempt.
 
-After merging into `podsan`, mirror to GitLab, rebuild the fork image, then
-redeploy `calrs-podsan`. Existing `calrs=info` logging includes the diagnostics.
-Verify the running image rather than the current target of the moving tag:
+The page shows the last stage, elapsed time, last complete verification, a
+diagnostic reference and a safe error code/HTTP status. It links to write-calendar
+setup after a successful first sync. Sharing these fields is sufficient; do not
+copy calendar content or raw DavMail logs.
 
-```bash
-calrs_image_id=$(podman container inspect --format '{{.Image}}' podsan-p132-calrs-1)
-podman image inspect "$calrs_image_id" \
-  --format '{{index .Labels "org.opencontainers.image.revision"}}'
-podman exec podsan-p132-calrs-1 printenv CALRS_SYNC_LOOKBACK_DAYS
-```
+## Fetch and publication
 
-Start this command, click **Sync** once, and note the browser error time in UTC.
-Keep following the logs after a 504; stop with Ctrl-C after the attempt returns
-or after recording the last unfinished stage:
+CalDAV synchronization follows [RFC 4791 section 8.2.1](https://www.rfc-editor.org/rfc/rfc4791.html#section-8.2.1):
 
-```bash
-podman logs --since 1m --timestamps -f podsan-p132-calrs-1 2>&1 |
-  rg --line-buffered 'calrs::sync_diagnostics:'
-```
+1. Discover calendars and compare their ctags.
+2. Query only href/ETag for events overlapping the useful window.
+3. Download changed resources with calendar-multiget, in batches of 50.
+4. Recheck collection ctags, validate calendar data and publish the entire source
+   in one SQLite transaction.
 
-`sync_id`, `source_id` and `trigger` correlate the attempt; `request_id` identifies
-each HTTP request. Completion records contain `elapsed_ms`.
+The default lower bound is midnight UTC seven days ago
+(`CALRS_SYNC_LOOKBACK_DAYS`, valid range 0–36500). There is no arbitrary future
+cutoff: event types may have no booking horizon. This filters occurrences, NOT
+the DTSTART of a recurrence master. Complete masters and exceptions are retained,
+including old series. Recurrences are expanded only for the displayed/requested
+period with the RFC recurrence library; the former 2000-iteration truncation is
+removed. EXDATE, moved instances and UNTIL are interpreted with their timezones.
 
-| Observation | Interpretation |
-| --- | --- |
-| `discover_principal`, `discover_calendar_home`, `list_calendars` | CalDAV discovery; each PROPFIND currently has the upstream client's 10-second timeout. |
-| `response_headers` unfinished | Waiting for HTTP headers. |
-| `response_body` unfinished | Headers arrived; the body is still downloading. A 207 does not mean the download finished. |
-| `request_kind="time_range"` | Normal full fetch; `window_start` is its lower bound, with no future upper bound. |
-| `request_kind="unfiltered"` | The filtered REPORT was rejected; inspect the preceding HTTP status. |
-| `request_kind="initial_token"` | A separate REPORT may retrieve the entire calendar to obtain a token. |
-| `fetch_events` returned, but `sync` still active | The fetch/parsing finished; local processing, reconciliation or a subsequent token request remains. |
-| `stage="sync"` returns after the browser's 504 | Compare the attempt's timestamps with the reverse proxy's timeout and access logs. |
-| `outcome="error"` / `"abandoned"` | An operation returned an error / its future was dropped or panicked. Abrupt process termination cannot emit a final log. |
+There is no initial sync-token probe, speculative sync-collection, or unfiltered
+fallback in source synchronization. A server that rejects the bounded inventory,
+returns incomplete XML/properties, changes an object during download, or provides
+calendar data we cannot safely interpret causes an explicit failure. A valid empty
+inventory does clear the cache. Force Sync ignores cached ctags/ETags, but keeps
+the same date filter and safety checks.
 
-`response_bytes` is the completed decoded UTF-8 text length, not wire traffic;
-it is unavailable when body reading fails. New logs contain metadata only:
-no URLs, credentials, calendar names, ICS bodies or arbitrary error messages.
-Other existing logs can contain personal data; share only the filtered lines.
-The SMTP test-message dump and raw CalDAV response-body logs/errors have been
-removed. DavMail must also run below DEBUG: its wire/ICS dumps are independent
-of the Cal.rs logging level and are not disabled by `davmail.dumpICS=0` alone.
+Failed or cancelled work does not publish a partial snapshot, save premature
+ctags, or advance freshness. The previous complete cache stays intact. Credentials
+or URL/account changes invalidate verification and prevent an old worker from
+publishing. CalDAV orphan-booking reconciliation runs only after publication,
+outside the job result, still with remote confirm-before-cancel.
 
-## Maintenance boundary and limits
+Native EWS uses the same publication boundary, records its existing two-year
+coverage and rejects truncated CalendarView responses; it does not use the
+CalDAV ETag path. Unverified EWS deletions no longer auto-cancel bookings.
 
-The adapter in `src/sync_diagnostics.rs` wraps the existing request builder and
-response without constructing requests, parsing calendars or updating the DB.
-Its tests live separately. The upstream hooks are one module declaration,
-four `send_observed` calls, and wrappers around sync/discovery/fetch futures.
-When rebasing, preserve upstream behavior and reattach these hooks as needed;
-do not copy the upstream sync implementation into a downstream module.
+## Limits and booking safety
 
-This diagnostic change preserves timeout values, the unfiltered fallback,
-initial-token fetching, SQL writes and existing error handling. An `ok` record
-means that operation returned `Ok`, not that every calendar was synchronized:
-upstream currently swallows some fetch/write failures. Inspect inner stages and
-HTTP statuses. Credential setup, lock waits and individual DB writes are not timed.
+No additional service is required: SQLite holds status; Tokio runs at most two
+workers per process. One atomic DB claim per source deduplicates manual, automatic,
+guest-triggered and CLI synchronization. Automatic failures back off for one minute;
+manual retry is immediate.
 
-Separate follow-up fixes should address false success/freshness after failed
-calendar fetches, ctag saved before a first successful fetch, and unfiltered
-REPORT errors being parsed as empty calendars. They are deliberately excluded
-from this instrumentation PR and can be proposed upstream independently.
+The total deadline is 180 seconds, including queue time. Existing upstream
+timeouts remain 10 seconds for discovery and 60 seconds for REPORTs. CalDAV
+responses are capped at 16 MiB and staged calendar content at 64 MiB. Interrupted
+jobs become explicit failures after their 190-second recovery lease expires.
+
+Booking checks withhold availability if a contributing source has never been
+verified, last failed (including while its retry runs), is over five minutes old,
+or does not cover the requested window. A fresh complete snapshot remains usable
+during a normal refresh. A source with no discovered calendars is not treated as
+an empty calendar. Users with no calendar source keep their existing behavior.
+The reminder loop proactively queues stale sources; guest pages also enqueue
+without waiting for Exchange. SQL read failures block availability.
+
+Unsupported sub-daily rules, RDATE/RANGE=THISANDFUTURE and unknown timezone
+identifiers fail explicitly; they must not silently become free time. An expansion
+safety limit blocks the requested period and emits `recurrence_limit` metadata.
+The new status UI is provided in French and English; other shipped locales
+currently contain explicitly marked English copy.
+
+This is not a distributed reservation lock: Outlook can change immediately
+after verification. Nor does it guarantee that every network or proxy is always
+available. The change removes the long Exchange operation from the source-sync
+HTTP request and makes failures observable and conservative. Shared-resource
+(room) synchronization remains a separate workflow.
+
+## Deployment and diagnosis
+
+Merge through human review, rebuild the Calrs fork, mirror/deploy it through the
+normal PodSaN workflow, and verify the running image revision. No proxy timeout
+increase or new infrastructure is needed. Deploy the DavMail log hardening too.
+
+Back up SQLite before upgrading (migration 064). Existing sources deliberately
+start unverified because older versions could record false successes: their
+booking availability is withheld until the first successful background sync.
+Test one busy account before general rollout, including an old recurring meeting,
+a moved/deleted occurrence and an Outlook conflict. To roll back, stop the new
+workers and restore the pre-upgrade DB backup together with the previous image.
+
+If a 504 still occurs on the short Sync POST or status GET, record its timestamp,
+request path and running image revision, then inspect the actual reverse proxy.
+Do not attribute it automatically to Exchange.
+
+For operator-only metadata, run `./scripts/diagnose-sync.sh` in `calrs-podsan`.
+It remains compatible with older instrumentation and prints only selected stages,
+duration and allowlisted error codes. The full attempt ID shown in the page is the
+same `sync_id` in Calrs diagnostic spans; `request_id` identifies each upstream
+request. `response_headers` versus `response_body` pinpoints where an HTTP wait
+occurred. A final `background sync finished outcome="ok"` means a complete
+snapshot was verified, unlike an old intermediate “step finished” record.
+
+No diagnostic payload contains credentials, URLs, email/calendar contents or
+arbitrary upstream error text. The SMTP test-message/body dumps have been removed.
+ICS content still exists in the private application cache because recurrence
+masters and exceptions are needed. DavMail must run at WARN or above: its DEBUG
+wire dumps are independent of Calrs and are not disabled by dumpICS=0 alone.
+Old log files are not automatically erased.

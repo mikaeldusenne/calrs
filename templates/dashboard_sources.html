@@ -12,6 +12,7 @@
       <div style="display: flex; justify-content: space-between; align-items: center;">
         <div style="flex: 1; min-width: 0;">
           <strong>{{ s.name }}</strong>
+          <a href="/dashboard/sources/{{ s.id }}/sync" style="margin-left: 0.5rem;">{{ t("sync-heading") }}</a>
           {% if s.provider_label %}
             <span style="margin-left: 0.5rem; font-size: 0.7rem; padding: 0.125rem 0.5rem; border: 1px solid var(--border); border-radius: 999px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em;">{{ s.provider_label }}</span>
           {% endif %}

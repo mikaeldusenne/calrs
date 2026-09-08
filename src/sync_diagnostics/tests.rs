@@ -89,8 +89,8 @@ async fn full_sync_with_observers_completes() {
         let body = match request.uri().path() {
             "/" => "<d:current-user-principal><d:href>/principal</d:href></d:current-user-principal>",
             "/principal" => "<cal:calendar-home-set><d:href>/home</d:href></cal:calendar-home-set>",
-            "/home" => "<d:multistatus><d:response><d:href>/cal/</d:href><d:propstat><d:prop><d:resourcetype><cal:calendar/></d:resourcetype></d:prop></d:propstat></d:response></d:multistatus>",
-            _ => "<d:multistatus><d:sync-token>test-token</d:sync-token></d:multistatus>",
+            "/home" => "<d:multistatus xmlns:d=\"DAV:\" xmlns:cal=\"urn:ietf:params:xml:ns:caldav\"><d:response><d:href>/cal/</d:href><d:propstat><d:prop><d:resourcetype><cal:calendar/></d:resourcetype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>",
+            _ => "<d:multistatus xmlns:d=\"DAV:\"/>",
         };
         (StatusCode::MULTI_STATUS, body)
     }));
@@ -109,19 +109,29 @@ async fn full_sync_with_observers_completes() {
         .unwrap();
     sqlx::query("INSERT INTO caldav_sources (id, account_id, name, url, username) VALUES ('s', 'a', 'Test', ?, 'test')")
         .bind(&url).execute(&pool).await.unwrap();
-    let client = crate::caldav::CaldavClient::new(&url, "test", "password");
+    sqlx::query("UPDATE caldav_sources SET password_enc = ? WHERE id = 's'")
+        .bind(crate::crypto::encrypt_password(&[0; 32], "password").unwrap())
+        .execute(&pool)
+        .await
+        .unwrap();
     sync(
         "s",
         "test",
-        crate::commands::sync::sync_source(&pool, &[0; 32], &client, "s"),
+        crate::commands::sync::sync_source_by_id(&pool, &[0; 32], "s", false),
     )
     .await
     .unwrap();
-    let token: String =
+    let token: Option<String> =
         sqlx::query_scalar("SELECT sync_token FROM calendars WHERE source_id = 's'")
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(token, "test-token");
+    assert_eq!(token, None);
+    let verified: Option<String> =
+        sqlx::query_scalar("SELECT sync_verified_at FROM caldav_sources WHERE id = 's'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(verified.is_some());
     server.abort();
 }

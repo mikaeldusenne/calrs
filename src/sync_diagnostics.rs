@@ -6,9 +6,53 @@ use tracing::{Instrument, Span};
 
 pub(crate) const TARGET: &str = "calrs::sync_diagnostics";
 
+#[derive(Debug)]
+pub(crate) struct SyncFailure {
+    pub code: &'static str,
+    pub http_status: Option<u16>,
+}
+impl SyncFailure {
+    pub(crate) fn new(code: &'static str) -> Self {
+        Self {
+            code,
+            http_status: None,
+        }
+    }
+    pub(crate) fn http(status: u16) -> Self {
+        Self {
+            code: "http_status",
+            http_status: Some(status),
+        }
+    }
+}
+impl std::fmt::Display for SyncFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.code)?;
+        if let Some(status) = self.http_status {
+            write!(f, " (HTTP {status})")?;
+        }
+        Ok(())
+    }
+}
+impl std::error::Error for SyncFailure {}
+
+pub(crate) fn http_status(error: &anyhow::Error) -> Option<u16> {
+    error
+        .downcast_ref::<SyncFailure>()
+        .and_then(|e| e.http_status)
+        .or_else(|| {
+            error
+                .downcast_ref::<reqwest::Error>()
+                .and_then(|e| e.status())
+                .map(|s| s.as_u16())
+        })
+}
+
 /// Classify errors without exposing URLs, credentials, SQL values or response bodies.
 pub(crate) fn error_kind(error: &anyhow::Error) -> &'static str {
-    if let Some(error) = error.downcast_ref::<reqwest::Error>() {
+    if let Some(error) = error.downcast_ref::<SyncFailure>() {
+        error.code
+    } else if let Some(error) = error.downcast_ref::<reqwest::Error>() {
         if error.is_timeout() {
             "timeout"
         } else if error.is_connect() {
@@ -56,6 +100,7 @@ pub(crate) fn trace<T>(
 ) -> impl Future<Output = Result<T>> {
     Box::pin(
         async move {
+            crate::sync_jobs::stage(stage).await;
             let mut progress = Progress {
                 started: Instant::now(),
                 span: Span::current(),
@@ -70,10 +115,7 @@ pub(crate) fn trace<T>(
                     tracing::info!(target: TARGET, outcome = "ok", elapsed_ms, "sync step finished")
                 }
                 Err(error) => {
-                    let http_status = error
-                        .downcast_ref::<reqwest::Error>()
-                        .and_then(|e| e.status())
-                        .map(|status| status.as_u16());
+                    let http_status = http_status(error);
                     let io_kind = error
                         .chain()
                         .find_map(|cause| cause.downcast_ref::<std::io::Error>().map(|e| e.kind()));
@@ -142,7 +184,18 @@ impl ObservedResponse {
 
     pub(crate) fn text(self) -> impl Future<Output = Result<String>> {
         async move {
-            let text = trace("response_body", async { Ok(self.response.text().await?) }).await?;
+            let text = trace("response_body", async {
+                let mut response = self.response;
+                let mut body = Vec::new();
+                while let Some(chunk) = response.chunk().await? {
+                    if body.len() + chunk.len() > 16 * 1024 * 1024 {
+                        return Err(SyncFailure::new("response_too_large").into());
+                    }
+                    body.extend_from_slice(&chunk);
+                }
+                String::from_utf8(body).map_err(|_| SyncFailure::new("invalid_response").into())
+            })
+            .await?;
             tracing::info!(target: TARGET, response_bytes = text.len(), "HTTP response body read");
             Ok(text)
         }

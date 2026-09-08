@@ -4,6 +4,8 @@ use reqwest::{Client, RequestBuilder};
 use std::net::IpAddr;
 use std::time::Duration;
 
+pub(crate) mod snapshot;
+
 /// Host portion of Google's CalDAV API. Used to short-circuit the discovery
 /// flow, since Google's PROPFIND responses don't follow RFC 4791 closely
 /// enough for the standard discovery to work, and the URL pattern is fixed.
@@ -213,7 +215,7 @@ impl CaldavClient {
         if !status.is_success() && status.as_u16() != 207 {
             // Errors reach logs and dashboard pages. Never include upstream bodies:
             // CalDAV responses may contain event descriptions or credentials.
-            bail!("PROPFIND returned HTTP {}", status);
+            return Err(crate::sync_diagnostics::SyncFailure::http(status.as_u16()).into());
         }
 
         resp.text().await
@@ -327,7 +329,7 @@ impl CaldavClient {
     pub async fn list_calendars(&self, home_url: &str) -> Result<Vec<CalendarInfo>> {
         let url = self.resolve_url(home_url);
         let text = self.propfind(&url, "1", PROPFIND_CALENDARS).await?;
-        let calendars = parse_calendar_list(&text);
+        let calendars = snapshot::parse_calendars(&text)?;
         tracing::debug!(
             calendar_count = calendars.len(),
             response_len = text.len(),
@@ -512,7 +514,7 @@ impl CaldavClient {
 
     /// Fetch events from a calendar starting from a given UTC datetime.
     /// Uses RFC 4791 time-range filter to only retrieve future events.
-    /// Falls back to full fetch if the server rejects the time-range query.
+    /// Never falls back to an unfiltered request on failure.
     pub async fn fetch_events_since(
         &self,
         calendar_href: &str,
@@ -554,13 +556,11 @@ impl CaldavClient {
         let status = resp.status();
         let text = resp.text().await?;
 
-        // If the server doesn't support time-range, fall back to full fetch
         if !status.is_success() {
-            return self.fetch_events(calendar_href).await;
+            return Err(crate::sync_diagnostics::SyncFailure::http(status.as_u16()).into());
         }
 
-        let events = parse_event_responses(&text);
-        Ok(events)
+        snapshot::parse_events(&text)
     }
 }
 
@@ -594,6 +594,7 @@ pub struct RawEvent {
 /// start with `calendar` (`calendar-color`, `calendar-data`,
 /// `supported-calendar-component-set`) nor `addressbook` collections, so we
 /// require the element's local name to end exactly after `calendar`.
+#[cfg(test)]
 fn has_calendar_resourcetype(block: &str) -> bool {
     const NAME: &str = "calendar";
     let mut from = 0;
@@ -629,6 +630,7 @@ fn has_calendar_resourcetype(block: &str) -> bool {
     false
 }
 
+#[cfg(test)]
 fn parse_calendar_list(xml: &str) -> Vec<CalendarInfo> {
     let mut calendars = Vec::new();
     for response_block in split_responses(xml) {

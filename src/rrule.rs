@@ -1,28 +1,65 @@
-use chrono::{Datelike, Duration, NaiveDate, NaiveDateTime, Weekday};
+use crate::sync_diagnostics::SyncFailure;
+use chrono::{NaiveDateTime, TimeZone};
 
-/// A parsed RRULE.
-struct RRule {
-    freq: Freq,
-    interval: u32,
-    until: Option<NaiveDateTime>,
-    count: Option<u32>,
-    by_day: Vec<ByDay>,
+fn rule_set(
+    start: NaiveDateTime,
+    rule: &str,
+    tz: chrono_tz::Tz,
+) -> anyhow::Result<rrule::RRuleSet> {
+    // Sub-daily recurrence from a decades-old DTSTART can consume unbounded CPU.
+    // Fail explicitly, never interpret an unsupported rule as free time.
+    if !rule.split(';').any(|p| {
+        matches!(
+            p,
+            "FREQ=DAILY" | "FREQ=WEEKLY" | "FREQ=MONTHLY" | "FREQ=YEARLY"
+        )
+    }) {
+        return Err(SyncFailure::new("unsupported_recurrence").into());
+    }
+    let rule = rule
+        .split(';')
+        .map(|part| {
+            if let Some(until) = part.strip_prefix("UNTIL=").filter(|v| !v.ends_with('Z')) {
+                let until = if until.len() == 8 {
+                    format!("{until}T235959")
+                } else {
+                    until.to_owned()
+                };
+                crate::utils::parse_ical_datetime(&until)
+                    .and_then(|d| tz.from_local_datetime(&d).latest())
+                    .map(|d| {
+                        format!(
+                            "UNTIL={}",
+                            d.with_timezone(&chrono::Utc).format("%Y%m%dT%H%M%SZ")
+                        )
+                    })
+                    .unwrap_or_else(|| part.to_owned())
+            } else {
+                part.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(";");
+    format!(
+        "DTSTART;TZID={}:{}\nRRULE:{rule}",
+        tz.name(),
+        start.format("%Y%m%dT%H%M%S")
+    )
+    .parse()
+    .map_err(|_| SyncFailure::new("invalid_recurrence").into())
 }
 
-enum Freq {
-    Daily,
-    Weekly,
-    Monthly,
+pub(crate) fn validate(start: NaiveDateTime, rule: &str, tz: Option<&str>) -> anyhow::Result<()> {
+    rule_set(
+        start,
+        rule,
+        tz.and_then(|s| s.parse().ok()).unwrap_or(chrono_tz::UTC),
+    )
+    .map(|_| ())
 }
 
-#[derive(Clone)]
-struct ByDay {
-    weekday: Weekday,
-    nth: Option<i32>, // e.g. 2 for "2nd Monday", -1 for "last Friday"
-}
-
-/// Expand a recurring event into occurrences within [window_start, window_end).
-/// Returns (start, end) pairs for each occurrence.
+/// Expand in event-local wall time; callers convert occurrences to the host TZ.
+/// A safety limit/error blocks the requested window, NEVER silently truncates it.
 pub fn expand_rrule(
     event_start: NaiveDateTime,
     event_end: NaiveDateTime,
@@ -31,171 +68,58 @@ pub fn expand_rrule(
     window_start: NaiveDateTime,
     window_end: NaiveDateTime,
 ) -> Vec<(NaiveDateTime, NaiveDateTime)> {
-    let rrule = match parse_rrule(rrule_str) {
-        Some(r) => r,
-        None => return vec![],
-    };
+    expand_rrule_in_tz(
+        event_start,
+        event_end,
+        rrule_str,
+        exdates,
+        window_start,
+        window_end,
+        chrono_tz::UTC,
+    )
+}
 
-    let event_duration = event_end - event_start;
-    let mut results = Vec::new();
-    let max_iter = 2000; // safety cap
-    let mut iter_count = 0;
-
-    match rrule.freq {
-        Freq::Daily => {
-            let mut current_date = event_start.date();
-            let mut count_total = 0u32;
-            loop {
-                if iter_count >= max_iter {
-                    break;
-                }
-                iter_count += 1;
-
-                let occ_start = current_date.and_time(event_start.time());
-                let occ_end = occ_start + event_duration;
-
-                if let Some(until) = rrule.until {
-                    if occ_start > until {
-                        break;
-                    }
-                }
-                if occ_start >= window_end {
-                    break;
-                }
-
-                if !is_excluded(occ_start, exdates) {
-                    if let Some(count) = rrule.count {
-                        count_total += 1;
-                        if count_total > count {
-                            break;
-                        }
-                    }
-
-                    if occ_end > window_start {
-                        results.push((occ_start, occ_end));
-                    }
-                }
-
-                current_date += Duration::days(rrule.interval as i64);
-            }
-        }
-        Freq::Weekly => {
-            // Determine which weekdays to use
-            let weekdays: Vec<Weekday> = if rrule.by_day.is_empty() {
-                vec![event_start.weekday()]
-            } else {
-                rrule.by_day.iter().map(|bd| bd.weekday).collect()
-            };
-
-            let mut count_total = 0u32;
-            // Start from the week of the event, iterate by interval weeks
-            let event_week_start = week_start(event_start.date());
-            let mut current_week = event_week_start;
-
-            loop {
-                if iter_count >= max_iter {
-                    break;
-                }
-
-                for &wd in &weekdays {
-                    iter_count += 1;
-                    let day = current_week + Duration::days(weekday_offset(wd));
-                    let occ_start = day.and_time(event_start.time());
-                    let occ_end = occ_start + event_duration;
-
-                    if occ_start < event_start {
-                        continue;
-                    }
-                    if let Some(until) = rrule.until {
-                        if occ_start > until {
-                            return results;
-                        }
-                    }
-                    if occ_start >= window_end {
-                        return results;
-                    }
-
-                    if let Some(count) = rrule.count {
-                        count_total += 1;
-                        if count_total > count {
-                            return results;
-                        }
-                    }
-
-                    if occ_end > window_start && !is_excluded(occ_start, exdates) {
-                        results.push((occ_start, occ_end));
-                    }
-                }
-
-                current_week += Duration::weeks(rrule.interval as i64);
-            }
-        }
-        Freq::Monthly => {
-            let mut year = event_start.year();
-            let mut month = event_start.month();
-            let mut count_total = 0u32;
-
-            loop {
-                if iter_count >= max_iter {
-                    break;
-                }
-                iter_count += 1;
-
-                let occurrences_this_month: Vec<NaiveDate> = if rrule.by_day.is_empty() {
-                    // Same day of month
-                    match NaiveDate::from_ymd_opt(year, month, event_start.day()) {
-                        Some(d) => vec![d],
-                        None => vec![], // e.g. Feb 30
-                    }
-                } else {
-                    rrule
-                        .by_day
-                        .iter()
-                        .filter_map(|bd| {
-                            nth_weekday_of_month(year, month, bd.weekday, bd.nth.unwrap_or(1))
-                        })
-                        .collect()
-                };
-
-                for day in occurrences_this_month {
-                    let occ_start = day.and_time(event_start.time());
-                    let occ_end = occ_start + event_duration;
-
-                    if occ_start < event_start {
-                        continue;
-                    }
-                    if let Some(until) = rrule.until {
-                        if occ_start > until {
-                            return results;
-                        }
-                    }
-                    if occ_start >= window_end {
-                        return results;
-                    }
-
-                    if let Some(count) = rrule.count {
-                        count_total += 1;
-                        if count_total > count {
-                            return results;
-                        }
-                    }
-
-                    if occ_end > window_start && !is_excluded(occ_start, exdates) {
-                        results.push((occ_start, occ_end));
-                    }
-                }
-
-                // Advance by interval months
-                month += rrule.interval;
-                while month > 12 {
-                    month -= 12;
-                    year += 1;
-                }
-            }
-        }
+pub(crate) fn expand_rrule_in_tz(
+    event_start: NaiveDateTime,
+    event_end: NaiveDateTime,
+    rrule_str: &str,
+    exdates: &[NaiveDateTime],
+    window_start: NaiveDateTime,
+    window_end: NaiveDateTime,
+    tz: chrono_tz::Tz,
+) -> Vec<(NaiveDateTime, NaiveDateTime)> {
+    if window_start >= window_end {
+        return Vec::new();
     }
-
-    results
+    let blocked = || vec![(window_start, window_end)];
+    let duration = event_end - event_start;
+    let Ok(set) = rule_set(event_start, rrule_str, tz) else {
+        tracing::warn!(target: crate::sync_diagnostics::TARGET, error_kind = "invalid_recurrence", "availability blocked");
+        return blocked();
+    };
+    let Some(after) = window_start.checked_sub_signed(duration) else {
+        return blocked();
+    };
+    let zone = set.get_dt_start().timezone();
+    let Some(after) = zone.from_local_datetime(&after).earliest() else {
+        return blocked();
+    };
+    let Some(before) = zone.from_local_datetime(&window_end).latest() else {
+        return blocked();
+    };
+    let result = set.after(after).before(before).all(10_000);
+    if result.limited {
+        tracing::warn!(target: crate::sync_diagnostics::TARGET, error_kind = "recurrence_limit", "availability blocked");
+        return blocked();
+    }
+    result
+        .dates
+        .into_iter()
+        .map(|d| d.naive_local())
+        .filter(|d| *d < window_end && *d + duration > window_start)
+        .filter(|d| !exdates.contains(d))
+        .map(|d| (d, d + duration))
+        .collect()
 }
 
 /// Parse EXDATE values and RECURRENCE-ID overrides from raw iCal.
@@ -203,177 +127,107 @@ pub fn expand_rrule(
 /// Scans ALL VEVENTs in the resource: EXDATEs from the first (recurring) VEVENT,
 /// and RECURRENCE-ID values from any override VEVENTs (modified instances).
 pub fn extract_exdates(raw_ical: &str) -> Vec<NaiveDateTime> {
-    let mut exdates = Vec::new();
-
-    // Extract EXDATEs from the first VEVENT (the one with the RRULE)
-    if let Some(vevent_start) = raw_ical.find("BEGIN:VEVENT") {
-        let vevent_end = raw_ical[vevent_start..]
-            .find("END:VEVENT")
-            .map(|i| vevent_start + i)
-            .unwrap_or(raw_ical.len());
-        let vevent = &raw_ical[vevent_start..vevent_end];
-
-        for line in vevent.lines() {
-            let trimmed = line.trim();
-            if trimmed.starts_with("EXDATE") {
-                if let Some(colon) = trimmed.find(':') {
-                    let values = &trimmed[colon + 1..];
-                    for val in values.split(',') {
-                        if let Some(dt) = parse_exdate(val.trim()) {
-                            exdates.push(dt);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Also extract RECURRENCE-ID from any override VEVENTs in the same resource.
-    // These represent modified instances — the original occurrence should be excluded
-    // from RRULE expansion (the modified instance is stored/displayed separately).
-    for line in raw_ical.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("RECURRENCE-ID") {
-            if let Some(colon) = trimmed.find(':') {
-                let val = trimmed[colon + 1..].trim();
-                if let Some(dt) = parse_exdate(val) {
-                    exdates.push(dt);
-                }
-            }
-        }
-    }
-
-    exdates
+    extract_exdates_in_tz(raw_ical, None)
 }
 
-fn parse_exdate(s: &str) -> Option<NaiveDateTime> {
-    crate::utils::parse_ical_datetime(s)
-}
-
-fn parse_rrule(s: &str) -> Option<RRule> {
-    let mut freq = None;
-    let mut interval = 1u32;
-    let mut until = None;
-    let mut count = None;
-    let mut by_day = Vec::new();
-
-    for part in s.split(';') {
-        if let Some(val) = part.strip_prefix("FREQ=") {
-            freq = match val {
-                "DAILY" => Some(Freq::Daily),
-                "WEEKLY" => Some(Freq::Weekly),
-                "MONTHLY" => Some(Freq::Monthly),
-                _ => None,
-            };
-        } else if let Some(val) = part.strip_prefix("INTERVAL=") {
-            interval = val.parse().unwrap_or(1);
-        } else if let Some(val) = part.strip_prefix("UNTIL=") {
-            let v = val.strip_suffix('Z').unwrap_or(val);
-            until = NaiveDateTime::parse_from_str(v, "%Y%m%dT%H%M%S")
-                .ok()
-                .or_else(|| {
-                    NaiveDate::parse_from_str(v, "%Y%m%d")
-                        .ok()
-                        .and_then(|d| d.and_hms_opt(23, 59, 59))
-                });
-        } else if let Some(val) = part.strip_prefix("COUNT=") {
-            count = val.parse().ok();
-        } else if let Some(val) = part.strip_prefix("BYDAY=") {
-            for day_str in val.split(',') {
-                if let Some(bd) = parse_byday(day_str.trim()) {
-                    by_day.push(bd);
-                }
-            }
-        }
-    }
-
-    Some(RRule {
-        freq: freq?,
-        interval,
-        until,
-        count,
-        by_day,
-    })
-}
-
-fn parse_byday(s: &str) -> Option<ByDay> {
-    // "MO", "TU", "2MO", "-1FR", etc.
-    let (nth, day_part) = if s.len() > 2 {
-        let day_part = &s[s.len() - 2..];
-        let nth_part = &s[..s.len() - 2];
-        (nth_part.parse::<i32>().ok(), day_part)
-    } else {
-        (None, s)
-    };
-
-    let weekday = match day_part {
-        "MO" => Weekday::Mon,
-        "TU" => Weekday::Tue,
-        "WE" => Weekday::Wed,
-        "TH" => Weekday::Thu,
-        "FR" => Weekday::Fri,
-        "SA" => Weekday::Sat,
-        "SU" => Weekday::Sun,
-        _ => return None,
-    };
-
-    Some(ByDay { weekday, nth })
-}
-
-fn is_excluded(dt: NaiveDateTime, exdates: &[NaiveDateTime]) -> bool {
-    exdates.iter().any(|ex| {
-        // Match by date + time, or just by date for all-day events
-        *ex == dt || ex.date() == dt.date()
-    })
-}
-
-/// Monday-based week start for a given date.
-fn week_start(d: NaiveDate) -> NaiveDate {
-    let days_since_monday = d.weekday().num_days_from_monday() as i64;
-    d - Duration::days(days_since_monday)
-}
-
-/// Offset from Monday (0=Mon, 1=Tue, ..., 6=Sun).
-fn weekday_offset(wd: Weekday) -> i64 {
-    wd.num_days_from_monday() as i64
-}
-
-/// Find the Nth weekday of a month (e.g., 2nd Monday, 3rd Wednesday).
-/// nth=1 is first, nth=-1 is last.
-fn nth_weekday_of_month(year: i32, month: u32, weekday: Weekday, nth: i32) -> Option<NaiveDate> {
-    if nth > 0 {
-        // Find first occurrence of weekday in month
-        let first = NaiveDate::from_ymd_opt(year, month, 1)?;
-        let first_wd = first.weekday();
-        let diff = (weekday.num_days_from_monday() as i64 - first_wd.num_days_from_monday() as i64
-            + 7)
-            % 7;
-        let target = first + Duration::days(diff + (nth as i64 - 1) * 7);
-        if target.month() == month {
-            Some(target)
-        } else {
-            None
-        }
-    } else if nth == -1 {
-        // Last occurrence: start from end of month
-        let next_month = if month == 12 {
-            NaiveDate::from_ymd_opt(year + 1, 1, 1)?
-        } else {
-            NaiveDate::from_ymd_opt(year, month + 1, 1)?
+pub(crate) fn extract_exdates_in_tz(
+    raw_ical: &str,
+    event_zone: Option<chrono_tz::Tz>,
+) -> Vec<NaiveDateTime> {
+    let raw = crate::utils::unfold_ical(raw_ical);
+    let mut dates = Vec::new();
+    for line in raw.lines() {
+        let Some((header, values)) = line.split_once(':') else {
+            continue;
         };
-        let last_day = next_month - Duration::days(1);
-        let last_wd = last_day.weekday();
-        let diff =
-            (last_wd.num_days_from_monday() as i64 - weekday.num_days_from_monday() as i64 + 7) % 7;
-        Some(last_day - Duration::days(diff))
-    } else {
-        None
+        let property = header.split(';').next().unwrap_or("");
+        if !matches!(property, "EXDATE" | "RECURRENCE-ID") {
+            continue;
+        }
+        for value in values.split(',') {
+            if let Some(date) = crate::utils::parse_ical_datetime(value.trim()) {
+                let as_start = format!("DTSTART{}:{}", &header[property.len()..], value.trim());
+                let source_zone = crate::utils::extract_vevent_tzid(&as_start, "DTSTART");
+                dates.push(match event_zone {
+                    Some(zone) => {
+                        crate::utils::convert_event_to_tz(date, source_zone.as_deref(), zone)
+                    }
+                    None => date,
+                });
+            }
+        }
     }
+    dates
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{Duration, NaiveDate};
+
+    #[test]
+    fn decades_old_daily_series_is_not_truncated() {
+        let start = dt(2000, 1, 1, 9, 0);
+        let from = dt(2026, 9, 7, 0, 0);
+        let occurrences = expand_rrule(
+            start,
+            start + Duration::hours(1),
+            "FREQ=DAILY",
+            &[dt(2026, 9, 8, 9, 0)],
+            from,
+            from + Duration::days(3),
+        );
+        assert_eq!(
+            occurrences,
+            vec![
+                (dt(2026, 9, 7, 9, 0), dt(2026, 9, 7, 10, 0)),
+                (dt(2026, 9, 9, 9, 0), dt(2026, 9, 9, 10, 0))
+            ]
+        );
+    }
+
+    #[test]
+    fn count_is_applied_before_exclusions() {
+        let start = dt(2000, 1, 1, 9, 0);
+        assert!(expand_rrule(
+            start,
+            start + Duration::hours(1),
+            "FREQ=DAILY;COUNT=2",
+            &[start],
+            start + Duration::days(2),
+            start + Duration::days(3)
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn yearly_and_last_weekday_rules_are_supported() {
+        let start = dt(2000, 1, 1, 9, 0);
+        let from = dt(2026, 1, 1, 0, 0);
+        assert_eq!(
+            expand_rrule(
+                start,
+                start + Duration::hours(1),
+                "FREQ=YEARLY",
+                &[],
+                from,
+                from + Duration::days(1)
+            ),
+            vec![(dt(2026, 1, 1, 9, 0), dt(2026, 1, 1, 10, 0))]
+        );
+        assert_eq!(
+            expand_rrule(
+                start,
+                start + Duration::hours(1),
+                "FREQ=MONTHLY;BYDAY=MO,TU,WE,TH,FR;BYSETPOS=-1",
+                &[],
+                from,
+                dt(2026, 2, 1, 0, 0)
+            )[0]
+            .0,
+            dt(2026, 1, 30, 9, 0)
+        );
+    }
 
     fn dt(y: i32, m: u32, d: u32, h: u32, min: u32) -> NaiveDateTime {
         NaiveDate::from_ymd_opt(y, m, d)
@@ -744,8 +598,8 @@ mod tests {
     fn test_invalid_rrule() {
         let start = dt(2026, 3, 1, 9, 0);
         let end = dt(2026, 3, 1, 10, 0);
-        let results = expand_rrule(start, end, "FREQ=YEARLY", &[], start, end);
-        assert!(results.is_empty()); // YEARLY not supported
+        let results = expand_rrule(start, end, "FREQ=INVALID", &[], start, end);
+        assert_eq!(results, vec![(start, end)]); // Unknown is not free.
     }
 
     #[test]
@@ -753,44 +607,7 @@ mod tests {
         let start = dt(2026, 3, 1, 9, 0);
         let end = dt(2026, 3, 1, 10, 0);
         let results = expand_rrule(start, end, "", &[], start, end);
-        assert!(results.is_empty());
-    }
-
-    // --- nth_weekday_of_month ---
-
-    #[test]
-    fn test_first_monday_march_2026() {
-        assert_eq!(
-            nth_weekday_of_month(2026, 3, Weekday::Mon, 1),
-            Some(NaiveDate::from_ymd_opt(2026, 3, 2).unwrap())
-        );
-    }
-
-    #[test]
-    fn test_second_monday_march_2026() {
-        assert_eq!(
-            nth_weekday_of_month(2026, 3, Weekday::Mon, 2),
-            Some(NaiveDate::from_ymd_opt(2026, 3, 9).unwrap())
-        );
-    }
-
-    #[test]
-    fn test_last_friday_march_2026() {
-        assert_eq!(
-            nth_weekday_of_month(2026, 3, Weekday::Fri, -1),
-            Some(NaiveDate::from_ymd_opt(2026, 3, 27).unwrap())
-        );
-    }
-
-    #[test]
-    fn test_fifth_monday_march_2026_none() {
-        // March 2026 has 5 Mondays (2,9,16,23,30) so 5th exists
-        assert_eq!(
-            nth_weekday_of_month(2026, 3, Weekday::Mon, 5),
-            Some(NaiveDate::from_ymd_opt(2026, 3, 30).unwrap())
-        );
-        // But 6th doesn't
-        assert_eq!(nth_weekday_of_month(2026, 3, Weekday::Mon, 6), None);
+        assert_eq!(results, vec![(start, end)]);
     }
 
     // --- extract_exdates with multiple formats ---
@@ -809,31 +626,5 @@ mod tests {
             "BEGIN:VEVENT\nEXDATE:20260309T100000,20260316T100000,20260323T100000\nEND:VEVENT";
         let exdates = extract_exdates(ical);
         assert_eq!(exdates.len(), 3);
-    }
-
-    // --- week_start ---
-
-    #[test]
-    fn test_week_start_monday() {
-        let monday = NaiveDate::from_ymd_opt(2026, 3, 9).unwrap(); // Monday
-        assert_eq!(week_start(monday), monday);
-    }
-
-    #[test]
-    fn test_week_start_sunday() {
-        let sunday = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap(); // Sunday
-        assert_eq!(
-            week_start(sunday),
-            NaiveDate::from_ymd_opt(2026, 3, 9).unwrap()
-        );
-    }
-
-    #[test]
-    fn test_week_start_wednesday() {
-        let wed = NaiveDate::from_ymd_opt(2026, 3, 11).unwrap(); // Wednesday
-        assert_eq!(
-            week_start(wed),
-            NaiveDate::from_ymd_opt(2026, 3, 9).unwrap()
-        );
     }
 }
