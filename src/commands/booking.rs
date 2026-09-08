@@ -1,5 +1,5 @@
 use anyhow::{bail, Result};
-use chrono::{Datelike, Duration, Local, NaiveDate, NaiveTime};
+use chrono::{Datelike, Duration, Local, NaiveDate, NaiveTime, TimeZone, Utc};
 use chrono_tz::Tz;
 use clap::Subcommand;
 use colored::Colorize;
@@ -144,8 +144,39 @@ pub async fn run(pool: &SqlitePool, key: &[u8; 32], cmd: BookingCommands) -> Res
                 .and_then(|s| s.parse::<Tz>().ok())
                 .unwrap_or(Tz::UTC);
 
-            let conflicts: Vec<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
-                "SELECT e.start_at, e.end_at, e.summary, e.timezone FROM events e
+            let account_id: String =
+                sqlx::query_scalar("SELECT account_id FROM event_types WHERE id = ?")
+                    .bind(&et_id)
+                    .fetch_one(pool)
+                    .await?;
+            let start_utc = host_tz
+                .from_local_datetime(&buf_start)
+                .earliest()
+                .ok_or_else(|| anyhow::anyhow!("Ambiguous booking time"))?;
+            let end_utc = host_tz
+                .from_local_datetime(&buf_end)
+                .latest()
+                .ok_or_else(|| anyhow::anyhow!("Ambiguous booking time"))?;
+            if !crate::sync_jobs::available_for(
+                pool,
+                "",
+                &account_id,
+                Some(&et_id),
+                &start_utc
+                    .with_timezone(&Utc)
+                    .format("%Y%m%dT%H%M%SZ")
+                    .to_string(),
+                &end_utc
+                    .with_timezone(&Utc)
+                    .format("%Y%m%dT%H%M%SZ")
+                    .to_string(),
+            )
+            .await
+            {
+                bail!("Calendar is not verified. Run calrs sync and inspect its result before booking.");
+            }
+            let conflicts: Vec<(String, String, Option<String>, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+                "SELECT e.start_at, e.end_at, e.summary, e.timezone, e.rrule, e.raw_ical FROM events e
                  JOIN calendars c ON c.id = e.calendar_id
                  WHERE c.is_busy = 1
                    AND (NOT EXISTS (SELECT 1 FROM event_type_calendars WHERE event_type_id = ?)
@@ -157,7 +188,25 @@ pub async fn run(pool: &SqlitePool, key: &[u8; 32], cmd: BookingCommands) -> Res
             .fetch_all(pool)
             .await?;
 
-            for (bs, be, summary, event_tz) in &conflicts {
+            for (bs, be, summary, event_tz, rule, ical) in &conflicts {
+                if let Some(rule) = rule.as_ref().filter(|r| !r.is_empty()) {
+                    let busy = crate::web::expand_recurring_into_busy(
+                        &[(
+                            bs.clone(),
+                            be.clone(),
+                            rule.clone(),
+                            ical.clone(),
+                            event_tz.clone(),
+                        )],
+                        buf_start,
+                        buf_end,
+                        host_tz,
+                    );
+                    if busy.iter().any(|(s, e)| *s < buf_end && *e > buf_start) {
+                        bail!("Conflict with a recurring calendar event");
+                    }
+                    continue;
+                }
                 let ev_start = parse_ical_datetime(bs)
                     .map(|dt| convert_event_to_tz(dt, event_tz.as_deref(), host_tz));
                 let ev_end = parse_ical_datetime(be)

@@ -4,6 +4,8 @@ use reqwest::{Client, RequestBuilder};
 use std::net::IpAddr;
 use std::time::Duration;
 
+pub(crate) mod snapshot;
+
 /// Host portion of Google's CalDAV API. Used to short-circuit the discovery
 /// flow, since Google's PROPFIND responses don't follow RFC 4791 closely
 /// enough for the standard discovery to work, and the URL pattern is fixed.
@@ -211,11 +213,9 @@ impl CaldavClient {
         tracing::debug!(url = %url, status = %status, "PROPFIND response received");
 
         if !status.is_success() && status.as_u16() != 207 {
-            // Surface the response body. Servers like Google embed the actual reason
-            // (insufficient scope, API not enabled, etc.) in the body, not the status line.
-            let body = resp.text().await.unwrap_or_default();
-            let snippet: String = body.chars().take(500).collect();
-            bail!("PROPFIND {} returned {}: {}", url, status, snippet);
+            // Errors reach logs and dashboard pages. Never include upstream bodies:
+            // CalDAV responses may contain event descriptions or credentials.
+            return Err(crate::sync_diagnostics::SyncFailure::http(status.as_u16()).into());
         }
 
         resp.text().await
@@ -292,7 +292,10 @@ impl CaldavClient {
             }
         }
 
-        tracing::debug!(response_body = %text, "failed to parse principal from response");
+        tracing::debug!(
+            response_bytes = text.len(),
+            "failed to parse principal from response"
+        );
         bail!("Could not discover principal URL from response")
     }
 
@@ -315,7 +318,10 @@ impl CaldavClient {
             }
         }
 
-        tracing::debug!(response_body = %text, "failed to parse calendar-home-set from response");
+        tracing::debug!(
+            response_bytes = text.len(),
+            "failed to parse calendar-home-set from response"
+        );
         bail!("Could not discover calendar-home-set from response")
     }
 
@@ -323,14 +329,17 @@ impl CaldavClient {
     pub async fn list_calendars(&self, home_url: &str) -> Result<Vec<CalendarInfo>> {
         let url = self.resolve_url(home_url);
         let text = self.propfind(&url, "1", PROPFIND_CALENDARS).await?;
-        let calendars = parse_calendar_list(&text);
+        let calendars = snapshot::parse_calendars(&text)?;
         tracing::debug!(
             calendar_count = calendars.len(),
             response_len = text.len(),
             "listed calendars"
         );
         if calendars.is_empty() && !text.is_empty() {
-            tracing::debug!(response_body = %text, "no calendars parsed from response");
+            tracing::debug!(
+                response_bytes = text.len(),
+                "no calendars parsed from response"
+            );
         }
         Ok(calendars)
     }
@@ -350,8 +359,7 @@ impl CaldavClient {
 
         let status = resp.status();
         if !status.is_success() && status.as_u16() != 201 && status.as_u16() != 204 {
-            let body = resp.text().await.unwrap_or_default();
-            bail!("PUT {} returned {} — {}", url, status, body);
+            bail!("PUT returned HTTP {}", status);
         }
 
         Ok(())
@@ -425,8 +433,7 @@ impl CaldavClient {
 
         let status = resp.status();
         if !status.is_success() && status.as_u16() != 204 && status.as_u16() != 404 {
-            let body = resp.text().await.unwrap_or_default();
-            bail!("DELETE {} returned {} — {}", url, status, body);
+            bail!("DELETE returned HTTP {}", status);
         }
 
         Ok(())
@@ -507,7 +514,7 @@ impl CaldavClient {
 
     /// Fetch events from a calendar starting from a given UTC datetime.
     /// Uses RFC 4791 time-range filter to only retrieve future events.
-    /// Falls back to full fetch if the server rejects the time-range query.
+    /// Never falls back to an unfiltered request on failure.
     pub async fn fetch_events_since(
         &self,
         calendar_href: &str,
@@ -549,13 +556,11 @@ impl CaldavClient {
         let status = resp.status();
         let text = resp.text().await?;
 
-        // If the server doesn't support time-range, fall back to full fetch
         if !status.is_success() {
-            return self.fetch_events(calendar_href).await;
+            return Err(crate::sync_diagnostics::SyncFailure::http(status.as_u16()).into());
         }
 
-        let events = parse_event_responses(&text);
-        Ok(events)
+        snapshot::parse_events(&text)
     }
 }
 
@@ -589,6 +594,7 @@ pub struct RawEvent {
 /// start with `calendar` (`calendar-color`, `calendar-data`,
 /// `supported-calendar-component-set`) nor `addressbook` collections, so we
 /// require the element's local name to end exactly after `calendar`.
+#[cfg(test)]
 fn has_calendar_resourcetype(block: &str) -> bool {
     const NAME: &str = "calendar";
     let mut from = 0;
@@ -624,6 +630,7 @@ fn has_calendar_resourcetype(block: &str) -> bool {
     false
 }
 
+#[cfg(test)]
 fn parse_calendar_list(xml: &str) -> Vec<CalendarInfo> {
     let mut calendars = Vec::new();
     for response_block in split_responses(xml) {
@@ -1620,7 +1627,7 @@ END:VCALENDAR</c:calendar-data>
     // <current-user-principal>, but the URL we configure for Google OAuth2
     // sources is already the per-user principal endpoint, so discover_principal
     // short-circuits and returns it directly. discover_calendar_home then does
-    // a real PROPFIND so any error from Google surfaces with its actual body.
+    // a real PROPFIND so any error from Google surfaces with its HTTP status.
     #[tokio::test]
     async fn google_discover_principal_short_circuits() {
         let url = "https://apidata.googleusercontent.com/caldav/v2/alice%40gmail.com/user";
@@ -1628,6 +1635,44 @@ END:VCALENDAR</c:calendar-data>
 
         let principal = client.discover_principal().await.unwrap();
         assert_eq!(principal, url);
+    }
+
+    #[tokio::test]
+    async fn http_errors_keep_status_without_calendar_contents() {
+        use axum::{http::StatusCode, routing::any, Router};
+
+        let app = Router::new().fallback(any(|| async {
+            (
+                StatusCode::BAD_GATEWAY,
+                "<calendar-data>PRIVATE_EVENT patient@example.com</calendar-data>",
+            )
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = CaldavClient::new(&url, "user", "password");
+
+        let errors = [
+            client.discover_principal().await.unwrap_err(),
+            client
+                .put_event("/calendar", "uid", "event")
+                .await
+                .unwrap_err(),
+            client.delete_event("/calendar", "uid").await.unwrap_err(),
+        ];
+        for error in errors {
+            let message = error.to_string();
+            assert!(message.contains("502"), "{message}");
+            for private in [
+                "PRIVATE_EVENT",
+                "patient@example.com",
+                "calendar-data",
+                &url,
+            ] {
+                assert!(!message.contains(private), "{message}");
+            }
+        }
+        server.abort();
     }
 
     // --- private-host allowlist (SSRF opt-out) ---

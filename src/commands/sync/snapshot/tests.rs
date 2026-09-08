@@ -1,0 +1,262 @@
+use super::*;
+use axum::{
+    extract::{Request, State},
+    http::StatusCode,
+    routing::any,
+    Router,
+};
+use std::sync::{
+    atomic::{AtomicU8, Ordering},
+    Arc, Mutex,
+};
+
+const MASTER: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:old-series\r\nDTSTART;TZID=Europe/Paris:20000101T090000\r\nDTEND;TZID=Europe/Paris:20000101T100000\r\nRRULE:FREQ=DAILY\r\nEXDATE;TZID=Europe/Paris:20300908T090000\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:old-series\r\nRECURRENCE-ID;TZID=Europe/Paris:20300909T090000\r\nDTSTART;TZID=Europe/Paris:20300909T140000\r\nDTEND;TZID=Europe/Paris:20300909T150000\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+
+#[derive(Default)]
+pub(crate) struct Mock {
+    pub mode: AtomicU8,
+    pub requests: Mutex<Vec<String>>,
+}
+
+#[test]
+fn duration_is_parsed_or_explicitly_rejected() {
+    assert_eq!(parse_duration("PT30M").unwrap(), Duration::minutes(30));
+    assert_eq!(parse_duration("P1DT2H").unwrap(), Duration::hours(26));
+    assert_eq!(parse_duration("+P2W").unwrap(), Duration::weeks(2));
+    for value in [
+        "P",
+        "PT",
+        "PTS",
+        "PT1M1H",
+        "P1W1D",
+        "PT1",
+        "-PT1H",
+        "PT999999999999999999999H",
+    ] {
+        assert!(parse_duration(value).is_err(), "{value}");
+    }
+}
+
+fn multistatus(inner: &str) -> String {
+    format!(
+        r#"<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav" xmlns:cs="http://calendarserver.org/ns/">{inner}</d:multistatus>"#
+    )
+}
+
+async fn server(State(mock): State<Arc<Mock>>, request: Request) -> (StatusCode, String) {
+    let path = request.uri().path().to_owned();
+    let body = axum::body::to_bytes(request.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    mock.requests.lock().unwrap().push(body.clone());
+    assert!(
+        !body.contains("sync-collection"),
+        "DavMail must never receive an unfiltered token probe"
+    );
+    let mode = mock.mode.load(Ordering::SeqCst);
+    let result = match path.as_str() {
+        "/" => "<d:current-user-principal><d:href>/principal</d:href></d:current-user-principal>"
+            .to_string(),
+        "/principal" => {
+            "<c:calendar-home-set><d:href>/home</d:href></c:calendar-home-set>".to_string()
+        }
+        "/home" => multistatus(&format!(
+            r#"<d:response><d:href>/cal/</d:href><d:propstat><d:prop>
+            <d:resourcetype><c:calendar/></d:resourcetype><cs:getctag>ctag-{mode}</cs:getctag>
+            </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>"#
+        )),
+        "/cal/" => {
+            let inventory = body.contains("calendar-query");
+            if inventory {
+                assert!(body.contains("time-range start="));
+                assert!(!body.contains("calendar-data"));
+            } else {
+                assert!(body.contains("calendar-multiget"));
+                if mode == 1 {
+                    return (StatusCode::GATEWAY_TIMEOUT, "PRIVATE-EMAIL-CONTENT".into());
+                }
+                if mode == 5 {
+                    return std::future::pending().await;
+                }
+            }
+            if mode == 3 {
+                multistatus("")
+            } else {
+                let etag = if matches!(mode, 1 | 4 | 5) {
+                    "changed"
+                } else {
+                    "v1"
+                };
+                let ical = if mode == 4 {
+                    MASTER.replace("DTEND;TZID=Europe/Paris:20000101T100000", "DTEND:invalid")
+                } else {
+                    MASTER.into()
+                };
+                let data = if inventory {
+                    String::new()
+                } else {
+                    format!("<c:calendar-data><![CDATA[{ical}]]></c:calendar-data>")
+                };
+                multistatus(&format!(
+                    r#"<d:response><d:href>/cal/series.ics</d:href><d:propstat><d:prop>
+                    <d:getetag>"{etag}"</d:getetag>{data}</d:prop><d:status>HTTP/1.1 200 OK</d:status>
+                    </d:propstat></d:response>"#
+                ))
+            }
+        }
+        _ => panic!("Unexpected mock request"),
+    };
+    (StatusCode::MULTI_STATUS, result)
+}
+
+pub(crate) async fn fixture() -> (
+    SqlitePool,
+    CaldavClient,
+    Arc<Mock>,
+    tokio::task::JoinHandle<()>,
+) {
+    let mock = Arc::new(Mock::default());
+    let app = Router::new().fallback(any(server)).with_state(mock.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    crate::db::migrate(&pool).await.unwrap();
+    sqlx::query("INSERT INTO users (id, email, name, role, auth_provider, username) VALUES ('host', 'host@example.test', 'Host', 'user', 'local', 'host')").execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO accounts (id, name, email, user_id) VALUES ('a', 'Test', 'host@example.test', 'host')").execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO caldav_sources (id, account_id, name, url, username, password_enc) VALUES ('s', 'a', 'Test', ?, 'user', ?)")
+        .bind(&url).bind(crate::crypto::encrypt_password(&[0; 32], "secret").unwrap()).execute(&pool).await.unwrap();
+    (
+        pool,
+        CaldavClient::new(&url, "user", "secret"),
+        mock,
+        server,
+    )
+}
+
+#[tokio::test]
+async fn old_master_exceptions_and_etag_reuse_then_empty_snapshot() {
+    let (pool, client, mock, server) = fixture().await;
+    sync(&pool, &client, "s", false, 0).await.unwrap();
+    let events: Vec<(String, Option<String>)> =
+        sqlx::query_as("SELECT start_at, recurrence_id FROM events ORDER BY start_at")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].0, "20000101T090000");
+    assert_eq!(events[1].1.as_deref(), Some("20300909T090000"));
+    mock.requests.lock().unwrap().clear();
+    sync(&pool, &client, "s", false, 0).await.unwrap();
+    assert!(!mock
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|s| s.contains("calendar-query")));
+    mock.mode.store(2, Ordering::SeqCst);
+    sync(&pool, &client, "s", false, 0).await.unwrap();
+    assert!(!mock
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|s| s.contains("calendar-multiget")));
+    mock.mode.store(3, Ordering::SeqCst);
+    sync(&pool, &client, "s", false, 0).await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM events")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        0
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn upstream_or_validation_failure_preserves_entire_snapshot_and_success_timestamp() {
+    let (pool, client, mock, server) = fixture().await;
+    sync(&pool, &client, "s", false, 0).await.unwrap();
+    sqlx::query("UPDATE caldav_sources SET last_synced = '2000-01-01 00:00:00'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    for mode in [1, 4] {
+        mock.mode.store(mode, Ordering::SeqCst);
+        let error = sync(&pool, &client, "s", true, 0).await.unwrap_err();
+        assert!(!error.to_string().contains("PRIVATE"));
+        let (tag, count): (String, i64) =
+            sqlx::query_as("SELECT ctag, (SELECT COUNT(*) FROM events) FROM calendars")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!((tag.as_str(), count), ("ctag-0", 2));
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT last_synced FROM caldav_sources")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            "2000-01-01 00:00:00"
+        );
+    }
+    server.abort();
+}
+
+#[tokio::test]
+async fn failed_initial_fetch_does_not_cache_the_remote_ctag() {
+    let (pool, client, mock, server) = fixture().await;
+    mock.mode.store(1, Ordering::SeqCst);
+    assert!(sync(&pool, &client, "s", false, 0).await.is_err());
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM calendars")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        0
+    );
+    mock.mode.store(0, Ordering::SeqCst);
+    sync(&pool, &client, "s", false, 0).await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM events")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        2
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn credential_change_invalidates_cache_and_prevents_old_worker_publication() {
+    let (pool, client, _, server) = fixture().await;
+    sync(&pool, &client, "s", false, 0).await.unwrap();
+    sqlx::query("UPDATE caldav_sources SET username = 'different-account' WHERE id = 's'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (verified, revision): (Option<String>, i64) =
+        sqlx::query_as("SELECT sync_verified_at, sync_revision FROM caldav_sources WHERE id = 's'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(verified.is_none());
+    assert_eq!(revision, 1);
+    let error = sync(&pool, &client, "s", true, 0).await.unwrap_err();
+    assert_eq!(diagnostics::error_kind(&error), "remote_changed");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM events")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        2
+    );
+    server.abort();
+}

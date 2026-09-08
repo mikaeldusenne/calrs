@@ -1,0 +1,28 @@
+{% extends "dashboard_base.html" %}
+{% block title %}{{ t("sync-heading") }} — calrs{% endblock %}
+{% block dashboard_content %}
+<div class="card">
+  <h1>{{ t("sync-heading") }} — {{ job.name }}</h1>
+  <p role="status">{{ t(state_key) }}</p>
+  {% if active %}<p>{{ t("sync-background-note") }}</p>{% endif %}
+  {% if job.sync_id %}
+  <dl>
+    <dt>{{ t("sync-stage") }}</dt><dd>{{ t(stage_key) }}</dd>
+    <dt>{{ t("sync-elapsed") }}</dt><dd>{{ job.elapsed }} s</dd>
+    <dt>{{ t("sync-reference") }}</dt><dd><code>{{ job.sync_id }}</code></dd>
+  </dl>
+  {% endif %}
+  {% if job.sync_error and not active %}
+  <p role="alert">{{ t(error_key) }}{% if job.sync_http_status %} — HTTP {{ job.sync_http_status }}{% endif %} (<code>{{ job.sync_error }}</code>)</p>
+  <p>{{ t("sync-failed-note") }}</p>
+  {% endif %}
+  <p>{{ t("sync-last-verified") }} : {{ job.sync_verified_at or t("sync-never") }}{% if job.sync_verified_at %} UTC{% endif %}</p>
+  {% if job.needs_setup and job.sync_status == "ok" %}
+  <p><a href="/dashboard/sources/{{ source_id }}/setup-write">{{ t("sync-setup-write") }}</a></p>
+  {% endif %}
+  {% if not active %}
+  <form method="post" action="/dashboard/sources/{{ source_id }}/sync"><button type="submit" class="slot-btn">{{ t("sources-sync") }}</button></form>
+  {% endif %}
+  <p><a href="/dashboard/sources">{{ t("sync-back") }}</a></p>
+</div>
+{% endblock %}

@@ -101,6 +101,7 @@
         </div>
       </div>
 
+      {% if editing %}
       <div style="border-top: 1px solid var(--border); padding-top: 1.25rem; margin-top: 0.5rem;">
         <label style="display: flex; align-items: center; gap: 0.625rem; cursor: pointer; padding: 0.75rem; border: 1px solid var(--border); border-radius: var(--radius); transition: all 0.15s ease;">
           <input type="checkbox" name="no_test" style="accent-color: var(--accent); width: 1.125rem; height: 1.125rem;">
@@ -111,6 +112,7 @@
         </label>
       </div>
 
+      {% endif %}
       <button type="submit" class="btn" style="margin-top: 1.5rem;">{% if editing %}{{ t("source-form-save") }}{% else %}{{ t("source-form-add") }}{% endif %}</button>
     </div>
   </form>

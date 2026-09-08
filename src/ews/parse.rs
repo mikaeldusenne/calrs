@@ -43,6 +43,7 @@ pub struct EwsItemPage {
     pub items: Vec<EwsCalendarItem>,
     pub total: Option<u64>,
     pub included_count: usize,
+    pub includes_last: bool,
 }
 
 /// Outcome of `SyncFolderItems` — added / changed items (with iCal text), and
@@ -87,6 +88,7 @@ pub fn parse_calendar_items_response(xml: &str) -> Result<EwsItemPage> {
 
     // RootFolder TotalItemsInView / IncludesLastItemInRange / IndexedPagingOffset
     if let Some(root_tag) = find_first_open_tag(xml, "RootFolder") {
+        page.includes_last = attr(&root_tag, "IncludesLastItemInRange").as_deref() == Some("true");
         if let Some(total) = attr(&root_tag, "TotalItemsInView") {
             page.total = total.parse().ok();
         }

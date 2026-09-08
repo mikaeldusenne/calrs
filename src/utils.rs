@@ -56,8 +56,11 @@ pub fn split_vevents(ical: &str) -> Vec<String> {
 
 /// Extract a field value from a single VEVENT block.
 pub fn extract_vevent_field(vevent: &str, field: &str) -> Option<String> {
-    for line in vevent.lines() {
-        if line.starts_with(field) {
+    for line in unfold_ical(vevent).lines() {
+        if line
+            .strip_prefix(field)
+            .is_some_and(|rest| rest.starts_with([';', ':']))
+        {
             if let Some(colon_pos) = line.find(':') {
                 let value = line[colon_pos + 1..].trim().to_string();
                 if !value.is_empty() {
@@ -67,6 +70,14 @@ pub fn extract_vevent_field(vevent: &str, field: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// RFC 5545 content lines may be folded anywhere, including in an RRULE.
+pub(crate) fn unfold_ical(ical: &str) -> String {
+    ical.replace("\r\n ", "")
+        .replace("\r\n\t", "")
+        .replace("\n ", "")
+        .replace("\n\t", "")
 }
 
 /// Extract the TZID from a DTSTART or DTEND line in a VEVENT block.
@@ -100,7 +111,7 @@ pub fn extract_vevent_tzid(vevent: &str, field: &str) -> Option<String> {
             let after_tzid = &rest[tzid_pos + 5..];
             // TZID value ends at ':' or ';'
             let end = after_tzid.find([':', ';']).unwrap_or(after_tzid.len());
-            let tz = after_tzid[..end].trim();
+            let tz = after_tzid[..end].trim().trim_matches('"');
             if !tz.is_empty() {
                 return Some(tz.to_string());
             }

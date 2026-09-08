@@ -1,5 +1,6 @@
 pub mod captcha;
 pub mod meeting;
+mod source_sync;
 
 use crate::utils::{convert_event_to_tz, parse_ical_datetime};
 use axum::extract::{Form, Multipart, Path, Query, State};
@@ -576,22 +577,26 @@ pub async fn run_reminder_loop(pool: SqlitePool, secret_key: [u8; 32]) {
             tracing::info!(booking_id = %bid, "reminder sent");
         }
 
-        // Background sync: pick the stalest enabled source and sync it.
-        // With ctag + sync-token this is very cheap for unchanged calendars.
-        let stalest: Option<(String,)> = sqlx::query_as(
+        // Refresh before the five-minute safety threshold; enqueue without
+        // delaying reminders or letting one failing source starve the others.
+        let _ = crate::sync_jobs::expire(&pool).await;
+        let stale: Vec<String> = sqlx::query_scalar(
             "SELECT cs.id
              FROM caldav_sources cs
              WHERE cs.enabled = 1
-             ORDER BY COALESCE(cs.last_synced, '2000-01-01') ASC
-             LIMIT 1",
+               AND cs.sync_status NOT IN ('queued', 'running')
+               AND (cs.sync_finished_at IS NULL OR cs.sync_finished_at < datetime('now', '-60 seconds'))
+               AND (cs.sync_verified_at IS NULL OR cs.sync_verified_at < datetime('now', '-180 seconds') OR cs.sync_status = 'failed')
+             ORDER BY COALESCE(cs.sync_finished_at, '2000-01-01') ASC
+             LIMIT 2",
         )
-        .fetch_optional(&pool)
+        .fetch_all(&pool)
         .await
-        .unwrap_or(None);
+        .unwrap_or_default();
 
-        if let Some((source_id,)) = stalest {
-            crate::commands::sync::sync_source_by_id(&pool, &secret_key, &source_id).await;
-            tracing::debug!(source_id = %source_id, "background sync completed");
+        for source_id in stale {
+            let _ = crate::sync_jobs::enqueue(&pool, &secret_key, &source_id, false, "background")
+                .await;
         }
     }
 }
@@ -1360,10 +1365,13 @@ pub async fn create_router(pool: SqlitePool, data_dir: PathBuf, secret_key: [u8;
         .route("/dashboard/sources/{id}/test", post(test_source))
         .route("/dashboard/sources/google/connect", get(google_connect))
         .route("/dashboard/sources/google/callback", get(google_callback))
-        .route("/dashboard/sources/{id}/sync", post(sync_source))
+        .route(
+            "/dashboard/sources/{id}/sync",
+            get(source_sync::status).post(source_sync::start),
+        )
         .route(
             "/dashboard/sources/{id}/force-sync",
-            post(force_sync_source),
+            post(source_sync::force),
         )
         .route(
             "/dashboard/sources/{id}/setup-write",
@@ -6374,32 +6382,6 @@ async fn create_source(
         return render_source_form_error(&state, &auth_user, &e.to_string(), &form).into_response();
     }
 
-    // Test connection unless skip requested
-    let skip_test = form.no_test.as_deref() == Some("on");
-    if !skip_test {
-        let client =
-            match crate::providers::build_provider(&provider_type, &url, &username, &form.password)
-            {
-                Ok(c) => c,
-                Err(e) => {
-                    return render_source_form_error(&state, &auth_user, &e.to_string(), &form)
-                        .into_response();
-                }
-            };
-        match client.check_connection().await {
-            Ok(_) => {} // fine, even if features not explicitly advertised
-            Err(e) => {
-                let msg = tr1(
-                    auth_user.lang,
-                    "form-error-connection-failed",
-                    "error",
-                    &e.to_string(),
-                );
-                return render_source_form_error(&state, &auth_user, &msg, &form).into_response();
-            }
-        }
-    }
-
     let id = uuid::Uuid::new_v4().to_string();
     let password_enc = match crate::crypto::encrypt_password(&state.secret_key, &form.password) {
         Ok(enc) => enc,
@@ -6413,7 +6395,7 @@ async fn create_source(
         }
     };
 
-    let _ = sqlx::query(
+    let inserted = sqlx::query(
         "INSERT INTO caldav_sources (id, account_id, name, url, username, password_enc, provider_type) VALUES (?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
@@ -6426,32 +6408,16 @@ async fn create_source(
     .execute(&state.pool)
     .await;
 
-    tracing::info!(source_name = %name, provider = %provider_type, user = %auth_user.user.email, "calendar source added");
-
-    // Auto-sync immediately after creating the source, then redirect to
-    // write-back setup if calendars were found.
-    let (messages, calendar_count) = run_sync(
-        &state.pool,
-        &state.secret_key,
-        &id,
-        &provider_type,
-        &url,
-        &username,
-        &form.password,
-    )
-    .await;
-
-    if calendar_count > 0 {
-        let joined_messages = messages.join("\n");
-        let encoded_messages = urlencoding::encode(&joined_messages);
-        return Redirect::to(&format!(
-            "/dashboard/sources/{}/setup-write?sync_messages={}",
-            id, encoded_messages
-        ))
-        .into_response();
+    if inserted.is_err() {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "Could not save calendar source",
+        )
+            .into_response();
     }
 
-    Redirect::to("/dashboard/sources").into_response()
+    tracing::info!(target: crate::sync_diagnostics::TARGET, source_id = %id, "calendar source added");
+    source_sync::enqueue_response(&state, &id, false, "source_setup").await
 }
 
 fn render_source_form_error(
@@ -6882,340 +6848,6 @@ async fn test_source(
         .unwrap_or_else(|e| internal_error_body("template render", &e)),
     )
     .into_response()
-}
-
-/// Runs CalDAV sync using build_client_for_source (supports both basic and OAuth2).
-async fn run_sync_for_source(
-    pool: &SqlitePool,
-    key: &[u8; 32],
-    source_id: &str,
-    url: &str,
-    username: &str,
-    password_enc: Option<&str>,
-    auth_type: &str,
-    access_token_enc: Option<&str>,
-    token_expires_at: Option<&str>,
-    provider_type: &str,
-) -> (Vec<String>, usize) {
-    // EWS sources go through the provider trait — no OAuth2 dispatch needed.
-    if provider_type == crate::providers::factory::kinds::EWS {
-        let enc = match password_enc {
-            Some(e) => e,
-            None => return (vec!["EWS source missing password".to_string()], 0),
-        };
-        let password = match crate::crypto::decrypt_password(key, enc) {
-            Ok(p) => p,
-            Err(e) => return (vec![format!("Decrypt failed: {}", e)], 0),
-        };
-        return run_sync(
-            pool,
-            key,
-            source_id,
-            provider_type,
-            url,
-            username,
-            &password,
-        )
-        .await;
-    }
-    let client = match crate::oauth2_caldav::build_client_for_source(
-        pool,
-        key,
-        source_id,
-        url,
-        auth_type,
-        username,
-        password_enc,
-        access_token_enc,
-        token_expires_at,
-    )
-    .await
-    {
-        Ok(c) => c,
-        Err(e) => return (vec![format!("Failed to build client: {}", e)], 0),
-    };
-
-    match crate::sync_diagnostics::sync(
-        source_id,
-        "dashboard",
-        crate::commands::sync::sync_source(pool, key, &client, source_id),
-    )
-    .await
-    {
-        Ok(()) => {
-            let cal_count: i64 =
-                sqlx::query_scalar("SELECT COUNT(*) FROM calendars WHERE source_id = ?")
-                    .bind(source_id)
-                    .fetch_one(pool)
-                    .await
-                    .unwrap_or(0);
-            (vec!["Sync complete.".to_string()], cal_count as usize)
-        }
-        Err(e) => (vec![format!("Sync failed: {}", e)], 0),
-    }
-}
-
-/// Run discovery + sync for a freshly-created source with plaintext password.
-/// Dispatches on `provider_type`: EWS goes through the trait-based path,
-/// CalDAV reuses the existing `CaldavClient` + `sync_source` flow.
-async fn run_sync(
-    pool: &SqlitePool,
-    key: &[u8; 32],
-    source_id: &str,
-    provider_type: &str,
-    url: &str,
-    username: &str,
-    password: &str,
-) -> (Vec<String>, usize) {
-    if provider_type == crate::providers::factory::kinds::EWS {
-        let provider =
-            match crate::providers::build_provider(provider_type, url, username, password) {
-                Ok(p) => p,
-                Err(e) => return (vec![format!("Could not build provider: {}", e)], 0),
-            };
-        match crate::commands::sync::sync_ews_source(pool, key, provider.as_ref(), source_id).await
-        {
-            Ok(()) => {
-                let cal_count: i64 =
-                    sqlx::query_scalar("SELECT COUNT(*) FROM calendars WHERE source_id = ?")
-                        .bind(source_id)
-                        .fetch_one(pool)
-                        .await
-                        .unwrap_or(0);
-                (vec!["Sync complete.".to_string()], cal_count as usize)
-            }
-            Err(e) => (vec![format!("Sync failed: {}", e)], 0),
-        }
-    } else {
-        let client = crate::caldav::CaldavClient::new(url, username, password);
-        match crate::sync_diagnostics::sync(
-            source_id,
-            "source_setup",
-            crate::commands::sync::sync_source(pool, key, &client, source_id),
-        )
-        .await
-        {
-            Ok(()) => {
-                let cal_count: i64 =
-                    sqlx::query_scalar("SELECT COUNT(*) FROM calendars WHERE source_id = ?")
-                        .bind(source_id)
-                        .fetch_one(pool)
-                        .await
-                        .unwrap_or(0);
-                (vec!["Sync complete.".to_string()], cal_count as usize)
-            }
-            Err(e) => (vec![format!("Sync failed: {}", e)], 0),
-        }
-    }
-}
-
-async fn force_sync_source(
-    State(state): State<Arc<AppState>>,
-    auth_user: crate::auth::AuthUser,
-    headers: HeaderMap,
-    Path(source_id): Path<String>,
-    Form(csrf): Form<CsrfForm>,
-) -> impl IntoResponse {
-    if let Err(resp) = verify_csrf_token(&headers, &csrf._csrf) {
-        return resp;
-    }
-    let user = &auth_user.user;
-
-    // Verify ownership
-    let source: Option<(
-        String,
-        String,
-        String,
-        Option<String>,
-        String,
-        Option<String>,
-        Option<String>,
-        String,
-    )> = sqlx::query_as(
-        "SELECT cs.id, cs.url, cs.username, cs.password_enc, cs.auth_type, cs.access_token_enc, cs.token_expires_at, cs.provider_type
-         FROM caldav_sources cs JOIN accounts a ON a.id = cs.account_id
-         WHERE cs.id = ? AND a.user_id = ?",
-    )
-    .bind(&source_id)
-    .bind(&user.id)
-    .fetch_optional(&state.pool)
-    .await
-    .unwrap_or(None);
-
-    let (
-        sid,
-        url,
-        username,
-        password_enc,
-        auth_type,
-        access_token_enc,
-        token_expires_at,
-        provider_type,
-    ) = match source {
-        Some(s) => s,
-        None => {
-            return Html(crate::i18n::translate(
-                auth_user.lang,
-                "error-source-not-found",
-                None,
-            ))
-            .into_response()
-        }
-    };
-
-    // Clear sync tokens to force a full fetch (same as `calrs sync --full`)
-    let _ = sqlx::query("UPDATE calendars SET sync_token = NULL, ctag = NULL WHERE source_id = ?")
-        .bind(&sid)
-        .execute(&state.pool)
-        .await;
-
-    tracing::info!(source_id = %sid, "force full resync triggered from dashboard");
-
-    let name: String = sqlx::query_scalar("SELECT name FROM caldav_sources WHERE id = ?")
-        .bind(&sid)
-        .fetch_one(&state.pool)
-        .await
-        .unwrap_or_else(|_| "Source".to_string());
-
-    let (messages, _) = run_sync_for_source(
-        &state.pool,
-        &state.secret_key,
-        &sid,
-        &url,
-        &username,
-        password_enc.as_deref(),
-        &auth_type,
-        access_token_enc.as_deref(),
-        token_expires_at.as_deref(),
-        &provider_type,
-    )
-    .await;
-
-    render_sync_result(&state, &auth_user, &name, &messages).into_response()
-}
-
-async fn sync_source(
-    State(state): State<Arc<AppState>>,
-    auth_user: crate::auth::AuthUser,
-    headers: HeaderMap,
-    Path(source_id): Path<String>,
-    Form(csrf): Form<CsrfForm>,
-) -> impl IntoResponse {
-    if let Err(resp) = verify_csrf_token(&headers, &csrf._csrf) {
-        return resp;
-    }
-    let user = &auth_user.user;
-
-    let source: Option<(
-        String,
-        String,
-        String,
-        Option<String>,
-        String,
-        String,
-        Option<String>,
-        Option<String>,
-        String,
-    )> = sqlx::query_as(
-        "SELECT cs.id, cs.url, cs.username, cs.password_enc, cs.name, cs.auth_type, cs.access_token_enc, cs.token_expires_at, cs.provider_type
-         FROM caldav_sources cs
-         JOIN accounts a ON a.id = cs.account_id
-         WHERE cs.id = ? AND a.user_id = ?",
-    )
-    .bind(&source_id)
-    .bind(&user.id)
-    .fetch_optional(&state.pool)
-    .await
-    .unwrap_or(None);
-
-    let (
-        sid,
-        url,
-        username,
-        password_enc,
-        name,
-        auth_type,
-        access_token_enc,
-        token_expires_at,
-        provider_type,
-    ) = match source {
-        Some(s) => s,
-        None => {
-            return Html(crate::i18n::translate(
-                auth_user.lang,
-                "error-source-not-found",
-                None,
-            ))
-            .into_response()
-        }
-    };
-
-    tracing::info!(source_id = %sid, "calendar sync triggered from dashboard");
-
-    let (messages, calendar_count) = run_sync_for_source(
-        &state.pool,
-        &state.secret_key,
-        &sid,
-        &url,
-        &username,
-        password_enc.as_deref(),
-        &auth_type,
-        access_token_enc.as_deref(),
-        token_expires_at.as_deref(),
-        &provider_type,
-    )
-    .await;
-
-    // If write_calendar_href is not yet configured and we found calendars,
-    // redirect to the write-calendar setup page (onboarding flow).
-    let write_href: Option<String> =
-        sqlx::query_scalar("SELECT write_calendar_href FROM caldav_sources WHERE id = ?")
-            .bind(&sid)
-            .fetch_optional(&state.pool)
-            .await
-            .unwrap_or(None)
-            .flatten();
-
-    if write_href.is_none() && calendar_count > 0 {
-        let joined_messages = messages.join("\n");
-        let encoded_messages = urlencoding::encode(&joined_messages);
-        return Redirect::to(&format!(
-            "/dashboard/sources/{}/setup-write?sync_messages={}",
-            sid, encoded_messages
-        ))
-        .into_response();
-    }
-
-    render_sync_result(&state, &auth_user, &name, &messages).into_response()
-}
-
-fn render_sync_result(
-    state: &AppState,
-    auth_user: &crate::auth::AuthUser,
-    source_name: &str,
-    messages: &[String],
-) -> Html<String> {
-    let tmpl = match state.templates.get_template("source_test.html") {
-        Ok(t) => t,
-        Err(_) => {
-            return Html(format!(
-                "<p>{}</p><p><a href=\"/dashboard\">Back to dashboard</a></p>",
-                messages.join("<br>")
-            ))
-        }
-    };
-    let (impersonating, impersonating_name, _) = impersonation_ctx(auth_user);
-    Html(
-        tmpl.render(context! {
-            result => messages.join("\n"),
-            source_name => source_name,
-            sidebar => sidebar_context(auth_user, "sources"),
-            lang => auth_user.lang,
-            impersonating => impersonating,
-            impersonating_name => impersonating_name,
-        })
-        .unwrap_or_else(|e| internal_error_body("template render", &e)),
-    )
 }
 
 #[derive(Deserialize)]
@@ -12933,18 +12565,23 @@ pub(crate) fn expand_recurring_into_busy(
     let mut result = Vec::new();
     for (s, e, rrule_str, raw_ical, event_tz) in recurring {
         if let (Some(ev_start), Some(ev_end)) = (parse_ical_datetime(s), parse_ical_datetime(e)) {
+            let event_zone = event_tz
+                .as_deref()
+                .and_then(|s| s.parse::<Tz>().ok())
+                .unwrap_or(host_tz);
             let exdates = raw_ical
                 .as_deref()
-                .map(crate::rrule::extract_exdates)
+                .map(|ical| crate::rrule::extract_exdates_in_tz(ical, Some(event_zone)))
                 .unwrap_or_default();
             // Expand RRULE in the event's own timezone (correct for DST)
-            let occurrences = crate::rrule::expand_rrule(
+            let occurrences = crate::rrule::expand_rrule_in_tz(
                 ev_start,
                 ev_end,
                 rrule_str,
                 &exdates,
-                window_start,
-                window_end,
+                convert_event_to_tz(window_start, Some(host_tz.name()), event_zone),
+                convert_event_to_tz(window_end, Some(host_tz.name()), event_zone),
+                event_zone,
             );
             // Convert each occurrence to host timezone
             for (os, oe) in occurrences {
@@ -12952,6 +12589,8 @@ pub(crate) fn expand_recurring_into_busy(
                 let ce = convert_event_to_tz(oe, event_tz.as_deref(), host_tz);
                 result.push((cs, ce));
             }
+        } else {
+            return vec![(window_start, window_end)];
         }
     }
     result
@@ -12959,7 +12598,7 @@ pub(crate) fn expand_recurring_into_busy(
 
 /// Fetch busy times for a specific user (events from their calendars + their bookings).
 /// Event times are converted from their stored timezone to `host_tz`.
-async fn fetch_busy_times_for_user(
+pub(crate) async fn fetch_busy_times_for_user(
     pool: &SqlitePool,
     user_id: &str,
     window_start: NaiveDateTime,
@@ -12990,6 +12629,29 @@ async fn fetch_busy_times_for_user_ex(
     exclude_booking_id: Option<&str>,
     exclude_booking_uid: Option<&str>,
 ) -> Vec<(NaiveDateTime, NaiveDateTime)> {
+    let Some(start_utc) = host_tz.from_local_datetime(&window_start).earliest() else {
+        return vec![(window_start, window_end)];
+    };
+    let Some(end_utc) = host_tz.from_local_datetime(&window_end).latest() else {
+        return vec![(window_start, window_end)];
+    };
+    if !crate::sync_jobs::available(
+        pool,
+        user_id,
+        event_type_id,
+        &start_utc
+            .with_timezone(&Utc)
+            .format("%Y%m%dT%H%M%SZ")
+            .to_string(),
+        &end_utc
+            .with_timezone(&Utc)
+            .format("%Y%m%dT%H%M%SZ")
+            .to_string(),
+    )
+    .await
+    {
+        return vec![(window_start, window_end)];
+    }
     // Events are stored in compact iCal form ("YYYYMMDDTHHMMSS" for timed,
     // "YYYYMMDD" for all-day), so both overlap bounds must also be compact
     // with a time component. Using a date-only upper bound here ("YYYYMMDD")
@@ -12997,8 +12659,14 @@ async fn fetch_busy_times_for_user_ex(
     // ("20260618T100000" > "20260618"), so a same-day window (window_end on the
     // same date as the event, e.g. the single-slot window in pick_group_member)
     // would silently miss the event and treat a busy member as free.
-    let end_compact = window_end.format("%Y%m%dT%H%M%S").to_string();
-    let start_compact = window_start.format("%Y%m%dT%H%M%S").to_string();
+    // Stored event-local times may differ by more than a day from host time.
+    // Filter broadly in SQL; exact overlap is tested after timezone conversion.
+    let end_compact = (window_end + Duration::days(2))
+        .format("%Y%m%dT%H%M%S")
+        .to_string();
+    let start_compact = (window_start - Duration::days(2))
+        .format("%Y%m%dT%H%M%S")
+        .to_string();
     // ISO bounds are for the bookings sub-query below (bookings store ISO times).
     let end_iso = window_end.format("%Y-%m-%dT%H:%M:%S").to_string();
     let start_iso = window_start.format("%Y-%m-%dT%H:%M:%S").to_string();
@@ -13010,7 +12678,7 @@ async fn fetch_busy_times_for_user_ex(
     // still make the booking conflict with its own calendar copy.
     let exclude_uid = exclude_booking_uid.unwrap_or("");
 
-    let events: Vec<(String, String, Option<String>)> = sqlx::query_as(
+    let events: Vec<(String, String, Option<String>)> = match sqlx::query_as(
         "SELECT e.start_at, e.end_at, e.timezone FROM events e
          JOIN calendars c ON c.id = e.calendar_id
          JOIN caldav_sources cs ON cs.id = c.source_id
@@ -13033,7 +12701,10 @@ async fn fetch_busy_times_for_user_ex(
     .bind(&start_compact)
     .fetch_all(pool)
     .await
-    .unwrap_or_default();
+    {
+        Ok(rows) => rows,
+        Err(_) => return vec![(window_start, window_end)],
+    };
 
     let mut busy: Vec<(NaiveDateTime, NaiveDateTime)> = events
         .iter()
@@ -13044,9 +12715,12 @@ async fn fetch_busy_times_for_user_ex(
         })
         .collect();
 
-    let end_compact_rrule = window_end.format("%Y%m%dT235959").to_string();
-    let recurring: Vec<(String, String, String, Option<String>, Option<String>)> = sqlx::query_as(
-        "SELECT e.start_at, e.end_at, e.rrule, e.raw_ical, e.timezone FROM events e
+    let end_compact_rrule = (window_end + Duration::days(2))
+        .format("%Y%m%dT235959")
+        .to_string();
+    let recurring: Vec<(String, String, String, Option<String>, Option<String>)> =
+        match sqlx::query_as(
+            "SELECT e.start_at, e.end_at, e.rrule, e.raw_ical, e.timezone FROM events e
          JOIN calendars c ON c.id = e.calendar_id
          JOIN caldav_sources cs ON cs.id = c.source_id
          JOIN accounts a ON a.id = cs.account_id
@@ -13057,17 +12731,20 @@ async fn fetch_busy_times_for_user_ex(
            AND (e.transp IS NULL OR e.transp != 'TRANSPARENT')
            AND (? = '' OR e.uid != ?)
            AND e.rrule IS NOT NULL AND e.rrule != '' AND (e.start_at <= ? OR e.start_at <= ?)",
-    )
-    .bind(user_id)
-    .bind(et_id_for_filter)
-    .bind(et_id_for_filter)
-    .bind(exclude_uid)
-    .bind(exclude_uid)
-    .bind(&end_iso)
-    .bind(&end_compact_rrule)
-    .fetch_all(pool)
-    .await
-    .unwrap_or_default();
+        )
+        .bind(user_id)
+        .bind(et_id_for_filter)
+        .bind(et_id_for_filter)
+        .bind(exclude_uid)
+        .bind(exclude_uid)
+        .bind(&end_iso)
+        .bind(&end_compact_rrule)
+        .fetch_all(pool)
+        .await
+        {
+            Ok(rows) => rows,
+            Err(_) => return vec![(window_start, window_end)],
+        };
 
     busy.extend(expand_recurring_into_busy(
         &recurring,
@@ -13083,7 +12760,7 @@ async fn fetch_busy_times_for_user_ex(
     // a member of that team. An assigned booking must NOT mark the event
     // type owner busy: on a round-robin team the owner stays free when
     // another member took the booking (#146).
-    let bookings: Vec<(String, String)> = sqlx::query_as(
+    let bookings: Vec<(String, String)> = match sqlx::query_as(
         "SELECT b.start_at, b.end_at FROM bookings b
          JOIN event_types et ON et.id = b.event_type_id
          JOIN accounts a ON a.id = et.account_id
@@ -13105,7 +12782,10 @@ async fn fetch_busy_times_for_user_ex(
     .bind(exclude_id)
     .fetch_all(pool)
     .await
-    .unwrap_or_default();
+    {
+        Ok(rows) => rows,
+        Err(_) => return vec![(window_start, window_end)],
+    };
 
     for (s, e) in &bookings {
         if let (Some(start), Some(end)) = (parse_ical_datetime(s), parse_ical_datetime(e)) {
@@ -17618,20 +17298,8 @@ async fn google_callback(
         }
     };
 
-    // Auto-sync
-    let (_, calendar_count) = run_sync_for_source(
-        &state.pool,
-        &state.secret_key,
-        &source_id,
-        &caldav_url,
-        &google_email,
-        None,
-        "oauth2",
-        Some(&access_token_enc),
-        Some(&expires_at.to_rfc3339()),
-        crate::providers::factory::kinds::CALDAV,
-    )
-    .await;
+    let sync_response =
+        source_sync::enqueue_response(&state, &source_id, true, "source_setup").await;
 
     // Clear transient cookies. The browser only honors removal of
     // __Host-prefixed cookies when the Set-Cookie also has Secure and Path=/,
@@ -17651,12 +17319,7 @@ async fn google_callback(
             .unwrap(),
     );
 
-    let redirect = if calendar_count > 0 {
-        Redirect::to(&format!("/dashboard/sources/{}/setup-write", source_id))
-    } else {
-        Redirect::to("/dashboard/sources")
-    };
-    (headers, redirect).into_response()
+    (headers, sync_response).into_response()
 }
 
 // --- Captcha settings ---
@@ -23201,7 +22864,7 @@ mod tests {
         let cal_id = uuid::Uuid::new_v4().to_string();
         let event_id = uuid::Uuid::new_v4().to_string();
         let uid = uuid::Uuid::new_v4().to_string();
-        sqlx::query("INSERT INTO caldav_sources (id, account_id, name, url, username) VALUES (?, ?, 'Src', 'https://x/dav', 'u')")
+        sqlx::query("INSERT INTO caldav_sources (id, account_id, name, url, username, sync_verified_at, sync_window_start) VALUES (?, ?, 'Src', 'https://x/dav', 'u', datetime('now'), '20000101T000000Z')")
             .bind(&source_id).bind(account_id).execute(pool).await.unwrap();
         sqlx::query("INSERT INTO calendars (id, source_id, href, display_name, is_busy) VALUES (?, ?, '/cal/', 'Cal', 1)")
             .bind(&cal_id).bind(&source_id).execute(pool).await.unwrap();
@@ -27250,8 +26913,8 @@ mod tests {
         let source_id = uuid::Uuid::new_v4().to_string();
         let calendar_id = uuid::Uuid::new_v4().to_string();
         sqlx::query(
-            "INSERT INTO caldav_sources (id, account_id, name, url, username) \
-             VALUES (?, ?, 'Write calendar', 'https://calendar.test', 'host')",
+            "INSERT INTO caldav_sources (id, account_id, name, url, username, sync_verified_at, sync_window_start) \
+             VALUES (?, ?, 'Write calendar', 'https://calendar.test', 'host', datetime('now'), '20000101T000000Z')",
         )
         .bind(&source_id)
         .bind(&account_id)
@@ -29767,6 +29430,136 @@ mod tests {
     // --- Dashboard pages: new event type form ---
 
     #[tokio::test]
+    async fn sync_http_returns_immediately_deduplicates_and_protects_status() {
+        let (app, pool, session, _) = setup_test_app().await;
+        let sid = seed_source(&pool, "Calendar", "PRIVATE-PASSWORD").await;
+        let lock = crate::commands::sync::source_lock(&sid).await;
+        let guard = lock.lock().await;
+        let uri = format!("/dashboard/sources/{sid}/sync");
+        let csrf = "sync-csrf";
+        let response = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            app.clone()
+                .oneshot(post_form(&uri, &session, csrf, "_csrf=sync-csrf")),
+        )
+        .await
+        .expect("sync POST waited for the calendar worker")
+        .unwrap();
+        assert_eq!(response.status(), 303);
+        assert_eq!(response.headers()["location"], uri);
+        let id: String = sqlx::query_scalar("SELECT sync_id FROM caldav_sources WHERE id = ?")
+            .bind(&sid)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let response = app
+            .clone()
+            .oneshot(post_form(&uri, &session, csrf, "_csrf=sync-csrf"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 303);
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT sync_id FROM caldav_sources WHERE id = ?")
+                .bind(&sid)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            id
+        );
+        let response = app
+            .clone()
+            .oneshot(get_authed(&uri, &session))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        assert_eq!(response.headers()["refresh"], "2");
+        let html = body_string(response).await;
+        assert!(html.contains(&id));
+        for private in ["PRIVATE-PASSWORD", "example.com/dav", "olduser"] {
+            assert!(!html.contains(private));
+        }
+        // Change ownership to another account. Existing session cannot read or retry.
+        sqlx::query("INSERT INTO accounts (id, name, email) VALUES ('other-account', 'Other', 'other@example.test')")
+            .execute(&pool).await.unwrap();
+        sqlx::query("UPDATE caldav_sources SET account_id = 'other-account' WHERE id = ?")
+            .bind(&sid)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            app.clone()
+                .oneshot(get_authed(&uri, &session))
+                .await
+                .unwrap()
+                .status(),
+            404
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(post_form(&uri, &session, csrf, "_csrf=sync-csrf"))
+                .await
+                .unwrap()
+                .status(),
+            404
+        );
+        assert_eq!(
+            app.oneshot(post_form(&uri, &session, csrf, "_csrf=wrong"))
+                .await
+                .unwrap()
+                .status(),
+            403
+        );
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn booking_is_refused_when_calendar_has_never_been_verified() {
+        let (app, pool, _, _) = setup_test_app().await;
+        let _sid = seed_source(&pool, "Calendar", "secret").await;
+        let mut date = Utc::now().date_naive() + Duration::days(1);
+        while date.weekday() != chrono::Weekday::Mon {
+            date += Duration::days(1);
+        }
+        let csrf = "sync-booking";
+        let body =
+            format!("_csrf={csrf}&date={date}&time=10%3A00&name=Guest&email=guest%40example.test");
+        app.oneshot(post_form_unauthed(
+            "/u/testuser/test-meeting/book",
+            csrf,
+            &body,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM bookings")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn recurrence_window_until_and_exclusions_respect_timezones() {
+        let recurring = vec![(
+            "20000101T003000".into(),
+            "20000101T013000".into(),
+            "FREQ=DAILY;UNTIL=20260907T120000Z".into(),
+            Some("BEGIN:VEVENT\nEXDATE:20260906T123000Z\nEND:VEVENT".into()),
+            Some("Pacific/Auckland".into()),
+        )];
+        // Local 00:30 Sep 8 is 12:30 Sep 7 UTC: after UNTIL, so absent.
+        let busy = expand_recurring_into_busy(
+            &recurring,
+            dt(2026, 9, 5, 12, 0),
+            dt(2026, 9, 7, 14, 0),
+            Tz::UTC,
+        );
+        assert_eq!(busy, vec![(dt(2026, 9, 5, 12, 30), dt(2026, 9, 5, 13, 30))]);
+    }
+
+    #[tokio::test]
     async fn new_event_type_form_returns_200() {
         let (app, _, session, _) = setup_test_app().await;
         let response = app
@@ -31538,9 +31331,9 @@ mod tests {
         // Keep the source fresh so the handler does not attempt network I/O.
         // The cached event below represents a prior successful write + sync.
         sqlx::query(
-            "INSERT INTO caldav_sources (id, account_id, name, url, username, last_synced, \
+            "INSERT INTO caldav_sources (id, account_id, name, url, username, sync_verified_at, sync_window_start, last_synced, \
              write_calendar_href) VALUES (?, ?, 'Alice calendar', \
-             'https://calendar.test', 'alice', datetime('now'), '/alice/')",
+             'https://calendar.test', 'alice', datetime('now'), '20000101T000000Z', datetime('now'), '/alice/')",
         )
         .bind(&alice_source)
         .bind(&alice_account)

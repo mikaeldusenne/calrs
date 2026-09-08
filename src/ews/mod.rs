@@ -101,11 +101,8 @@ impl CalendarProvider for EwsProvider {
         calendar_id: &str,
         since_utc: &str,
     ) -> Result<Vec<RawEvent>> {
-        // CalendarView wants both endpoints; pick a generous upper bound far
-        // enough out to cover every booking horizon calrs supports today.
-        // The 2-year window matches what the slot picker exposes — anything
-        // beyond that is going to be replaced by a fresh sync long before it
-        // becomes relevant.
+        // CalendarView requires both endpoints. The sync registry records this
+        // two-year upper bound so booking checks never assume wider coverage.
         let end_utc = upper_bound_iso(since_utc);
         let items = operations::list_items_in_window(
             &self.endpoint,
@@ -116,7 +113,12 @@ impl CalendarProvider for EwsProvider {
             &end_utc,
         )
         .await?;
-        Ok(synth_raw_events(items))
+        let count = items.len();
+        let events = synth_raw_events(items);
+        if events.len() != count {
+            return Err(crate::sync_diagnostics::SyncFailure::new("invalid_calendar").into());
+        }
+        Ok(events)
     }
 
     async fn sync_delta(&self, calendar_id: &str, sync_state: Option<&str>) -> Result<DeltaResult> {
