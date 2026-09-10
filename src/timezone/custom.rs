@@ -164,9 +164,6 @@ impl CustomZone {
         }
         transitions.sort_by_key(|t| t.utc);
         transitions.dedup_by(|a, b| a.utc == b.utc && a.from == b.from && a.to == b.to);
-        if transitions.windows(2).any(|w| w[0].utc == w[1].utc) {
-            return Err(INVALID);
-        }
         let transitions = Arc::new(transitions);
         let mut cache = self.cache.lock().map_err(|_| INVALID)?;
         if cache.len() >= 64 {
@@ -178,11 +175,24 @@ impl CustomZone {
 
     fn offset_at(transitions: &[Transition], utc: NaiveDateTime) -> Result<i32> {
         let index = transitions.partition_point(|t| t.utc <= utc);
-        if index == 0 {
-            transitions.first().map(|t| t.from).ok_or(INVALID)
-        } else {
-            Ok(transitions[index - 1].to)
+        let active = index.saturating_sub(1);
+        let transition = transitions.get(active).ok_or(INVALID)?;
+        // RFC 5545 §3.6.5: the latest onset determines the offset. Exchange
+        // may emit conflicting epoch seeds (1601-01-01); they must not poison
+        // dates governed by later, unambiguous transitions. Never pick a side
+        // while a conflict is active, including before the first onset.
+        if (active > 0 && transitions[active - 1].utc == transition.utc)
+            || transitions
+                .get(active + 1)
+                .is_some_and(|next| next.utc == transition.utc)
+        {
+            return Err(INVALID);
         }
+        Ok(if index == 0 {
+            transition.from
+        } else {
+            transition.to
+        })
     }
 
     pub(super) fn to_local(&self, utc: NaiveDateTime) -> Result<NaiveDateTime> {
@@ -220,6 +230,8 @@ impl CustomZone {
                 .checked_add_signed(Duration::seconds(transition.to.into()))
                 .ok_or(INVALID)?;
             if before <= local && local < after {
+                // Gap handling must not bypass the active-conflict check.
+                Self::offset_at(&transitions, transition.utc)?;
                 return Ok((
                     local
                         .checked_sub_signed(Duration::seconds(transition.from.into()))
@@ -268,6 +280,88 @@ mod tests {
 
     fn dt(value: &str) -> NaiveDateTime {
         parse_ical_datetime(value).unwrap()
+    }
+
+    const DAVMAIL: &str = include_str!("../../tests/fixtures/davmail-custom-timezone.ics");
+
+    #[test]
+    fn davmail_epoch_collision_does_not_poison_later_dst_rules() {
+        let zone = CustomZone::parse(DAVMAIL).unwrap();
+        for (local, utc, exists) in [
+            ("20260115T100000", "20260115T090000", true),
+            ("20260715T100000", "20260715T080000", true),
+            ("20260329T023000", "20260329T013000", false),
+            ("20261025T023000", "20261025T003000", true),
+        ] {
+            assert_eq!(zone.local_instant(dt(local)), Ok((dt(utc), exists)));
+            if exists {
+                assert_eq!(zone.to_local(dt(utc)), Ok(dt(local)));
+            }
+        }
+        assert_eq!(
+            zone.to_local(dt("20261025T013000")),
+            Ok(dt("20261025T023000"))
+        );
+        // Do not silently choose a side when the conflicting seeds are active.
+        for utc in ["16001231T000000", "16010101T010000", "16010201T120000"] {
+            assert_eq!(zone.to_local(dt(utc)), Err(INVALID));
+        }
+        assert_eq!(zone.local_instant(dt("16010201T120000")), Err(INVALID));
+    }
+
+    #[test]
+    fn conflicting_transitions_block_only_their_effective_interval() {
+        let initial = "BEGIN:STANDARD\nDTSTART:20200101T000000\nTZOFFSETFROM:+0100\nTZOFFSETTO:+0100\nEND:STANDARD\n";
+        let first = "BEGIN:DAYLIGHT\nDTSTART:20260329T020000\nTZOFFSETFROM:+0100\nTZOFFSETTO:+0200\nEND:DAYLIGHT\n";
+        let second = "BEGIN:DAYLIGHT\nDTSTART:20260329T020000\nTZOFFSETFROM:+0100\nTZOFFSETTO:+0300\nEND:DAYLIGHT\n";
+        let recovery = "BEGIN:STANDARD\nDTSTART:20261025T030000\nTZOFFSETFROM:+0200\nTZOFFSETTO:+0100\nEND:STANDARD\n";
+        for conflicts in [format!("{first}{second}"), format!("{second}{first}")] {
+            let zone = CustomZone::parse(&format!("{initial}{conflicts}{recovery}")).unwrap();
+            assert_eq!(
+                zone.to_local(dt("20260115T090000")),
+                Ok(dt("20260115T100000"))
+            );
+            for utc in ["20260329T010000", "20260715T080000"] {
+                assert_eq!(zone.to_local(dt(utc)), Err(INVALID));
+            }
+            for local in ["20260329T023000", "20260329T033000", "20260715T100000"] {
+                assert_eq!(zone.local_instant(dt(local)), Err(INVALID));
+            }
+            assert_eq!(
+                zone.to_local(dt("20261025T010000")),
+                Ok(dt("20261025T020000"))
+            );
+            assert_eq!(
+                zone.local_instant(dt("20261115T100000")),
+                Ok((dt("20261115T090000"), true))
+            );
+            // A series starting before the conflict must not expose free slots
+            // when an occurrence later falls inside the ambiguous interval.
+            let stored = crate::timezone::Zone::Custom(Arc::new(zone))
+                .stored_name()
+                .unwrap();
+            let recurring = [(
+                "20260115T100000".into(),
+                "20260115T110000".into(),
+                "FREQ=DAILY".into(),
+                None,
+                Some(stored),
+            )];
+            let (start, end) = (dt("20260715T000000"), dt("20260716T000000"));
+            assert_eq!(
+                crate::web::expand_recurring_into_busy(&recurring, start, end, chrono_tz::UTC),
+                vec![(start, end)]
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_observances_are_not_conflicts() {
+        let zone = CustomZone::parse(&format!("{DAVMAIL}\n{DAVMAIL}")).unwrap();
+        assert_eq!(
+            zone.local_instant(dt("20260715T100000")),
+            Ok((dt("20260715T080000"), true))
+        );
     }
 
     #[test]
@@ -332,34 +426,37 @@ mod tests {
 
     #[test]
     fn custom_recurrence_counts_real_instances_and_compares_until_in_utc() {
-        let zone = crate::timezone::Zone::Custom(Arc::new(CustomZone::parse(PARIS).unwrap()));
-        let window = (dt("20260328T000000"), dt("20260401T000000"));
-        let busy = crate::rrule::expand_custom(
-            dt("20260328T023000"),
-            dt("20260328T033000"),
-            "FREQ=DAILY;COUNT=2",
-            &[],
-            window,
-            &zone,
-        )
-        .unwrap();
-        assert_eq!(
-            busy,
-            vec![
-                (dt("20260328T013000"), dt("20260328T023000")),
-                (dt("20260330T003000"), dt("20260330T013000"))
-            ]
-        );
-        let busy = crate::rrule::expand_custom(
-            dt("20000101T100000"),
-            dt("20000101T110000"),
-            "FREQ=DAILY;UNTIL=20260329T080000Z",
-            &[dt("20260328T100000")],
-            window,
-            &zone,
-        )
-        .unwrap();
-        assert_eq!(busy, vec![(dt("20260329T080000"), dt("20260329T090000"))]);
+        for definition in [PARIS, DAVMAIL] {
+            let zone =
+                crate::timezone::Zone::Custom(Arc::new(CustomZone::parse(definition).unwrap()));
+            let window = (dt("20260328T000000"), dt("20260401T000000"));
+            let busy = crate::rrule::expand_custom(
+                dt("20260328T023000"),
+                dt("20260328T033000"),
+                "FREQ=DAILY;COUNT=2",
+                &[],
+                window,
+                &zone,
+            )
+            .unwrap();
+            assert_eq!(
+                busy,
+                vec![
+                    (dt("20260328T013000"), dt("20260328T023000")),
+                    (dt("20260330T003000"), dt("20260330T013000"))
+                ]
+            );
+            let busy = crate::rrule::expand_custom(
+                dt("20000101T100000"),
+                dt("20000101T110000"),
+                "FREQ=DAILY;UNTIL=20260329T080000Z",
+                &[dt("20260328T100000")],
+                window,
+                &zone,
+            )
+            .unwrap();
+            assert_eq!(busy, vec![(dt("20260329T080000"), dt("20260329T090000"))]);
+        }
     }
 
     #[test]
