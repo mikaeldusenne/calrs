@@ -260,3 +260,65 @@ async fn credential_change_invalidates_cache_and_prevents_old_worker_publication
     );
     server.abort();
 }
+
+async fn stored_timezone(ical: &str) -> Result<Option<String>, String> {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    crate::db::migrate(&pool).await.unwrap();
+    sqlx::query("INSERT INTO users (id, email, name, role, auth_provider, username) VALUES ('host', 'host@example.test', 'Host', 'user', 'local', 'host')").execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO accounts (id, name, email, user_id) VALUES ('a', 'Test', 'host@example.test', 'host')").execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO caldav_sources (id, account_id, name, url, username) VALUES ('s', 'a', 'Test', 'http://example.test', 'user')").execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO calendars (id, source_id, href) VALUES ('c', 's', '/cal/')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let mut conn = pool.acquire().await.unwrap();
+    store_events(&mut conn, "c", ical)
+        .await
+        .map_err(|e| diagnostics::error_kind(&e).to_string())?;
+    Ok(
+        sqlx::query_scalar("SELECT timezone FROM events WHERE calendar_id = 'c'")
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap(),
+    )
+}
+
+#[tokio::test]
+async fn exchange_windows_tzid_is_stored_as_iana() {
+    let ical = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VTIMEZONE\r\nTZID:Romance Standard Time\r\nX-LIC-LOCATION:Europe/Paris\r\nBEGIN:STANDARD\r\nDTSTART:16011028T030000\r\nTZOFFSETFROM:+0200\r\nTZOFFSETTO:+0100\r\nEND:STANDARD\r\nEND:VTIMEZONE\r\nBEGIN:VEVENT\r\nUID:exchange-1\r\nDTSTART;TZID=Romance Standard Time:20260310T100000\r\nDTEND;TZID=Romance Standard Time:20260310T110000\r\nSUMMARY:Staff\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+    assert_eq!(
+        stored_timezone(ical).await.unwrap().as_deref(),
+        Some("Europe/Paris")
+    );
+}
+
+#[tokio::test]
+async fn microsoft_olson_uri_is_stored_as_iana() {
+    let ical = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:ms-1\r\nDTSTART;TZID=\"tzone://Microsoft/Olson/Europe/Paris\":20260310T100000\r\nDTEND;TZID=\"tzone://Microsoft/Olson/Europe/Paris\":20260310T110000\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+    assert_eq!(
+        stored_timezone(ical).await.unwrap().as_deref(),
+        Some("Europe/Paris")
+    );
+}
+
+#[tokio::test]
+async fn vtimezone_defined_custom_id_is_accepted() {
+    let ical = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VTIMEZONE\r\nTZID:Customized Time Zone\r\nBEGIN:STANDARD\r\nDTSTART:16010101T000000\r\nTZOFFSETFROM:+0100\r\nTZOFFSETTO:+0100\r\nEND:STANDARD\r\nEND:VTIMEZONE\r\nBEGIN:VEVENT\r\nUID:custom-1\r\nDTSTART;TZID=Customized Time Zone:20260310T100000\r\nDTEND;TZID=Customized Time Zone:20260310T110000\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+    assert_eq!(
+        stored_timezone(ical).await.unwrap().as_deref(),
+        Some("Customized Time Zone")
+    );
+}
+
+#[tokio::test]
+async fn unknown_tzid_without_vtimezone_still_fails_closed() {
+    let ical = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:bad-1\r\nDTSTART;TZID=Not/AZone:20260310T100000\r\nDTEND;TZID=Not/AZone:20260310T110000\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+    assert_eq!(
+        stored_timezone(ical).await.unwrap_err(),
+        "unsupported_timezone"
+    );
+}

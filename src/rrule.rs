@@ -53,7 +53,8 @@ pub(crate) fn validate(start: NaiveDateTime, rule: &str, tz: Option<&str>) -> an
     rule_set(
         start,
         rule,
-        tz.and_then(|s| s.parse().ok()).unwrap_or(chrono_tz::UTC),
+        tz.and_then(crate::timezone::resolve_tzid)
+            .unwrap_or(chrono_tz::UTC),
     )
     .map(|_| ())
 }
@@ -137,17 +138,28 @@ pub(crate) fn extract_exdates_in_tz(
     let raw = crate::utils::unfold_ical(raw_ical);
     let mut dates = Vec::new();
     for line in raw.lines() {
-        let Some((header, values)) = line.split_once(':') else {
+        let property = if line.starts_with("EXDATE") {
+            "EXDATE"
+        } else if line.starts_with("RECURRENCE-ID") {
+            "RECURRENCE-ID"
+        } else {
             continue;
         };
-        let property = header.split(';').next().unwrap_or("");
-        if !matches!(property, "EXDATE" | "RECURRENCE-ID") {
+        let rest = &line[property.len()..];
+        if rest.is_empty() || !matches!(rest.as_bytes()[0], b';' | b':') {
             continue;
         }
+        let Some((params, values)) = crate::timezone::params_and_value(rest) else {
+            continue;
+        };
+        let source_zone = params
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("TZID"))
+            .map(|(_, v)| v.as_str())
+            .map(str::to_string)
+            .or_else(|| values.trim().ends_with('Z').then(|| "UTC".to_string()));
         for value in values.split(',') {
             if let Some(date) = crate::utils::parse_ical_datetime(value.trim()) {
-                let as_start = format!("DTSTART{}:{}", &header[property.len()..], value.trim());
-                let source_zone = crate::utils::extract_vevent_tzid(&as_start, "DTSTART");
                 dates.push(match event_zone {
                     Some(zone) => {
                         crate::utils::convert_event_to_tz(date, source_zone.as_deref(), zone)

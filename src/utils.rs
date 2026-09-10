@@ -57,15 +57,16 @@ pub fn split_vevents(ical: &str) -> Vec<String> {
 /// Extract a field value from a single VEVENT block.
 pub fn extract_vevent_field(vevent: &str, field: &str) -> Option<String> {
     for line in unfold_ical(vevent).lines() {
-        if line
-            .strip_prefix(field)
-            .is_some_and(|rest| rest.starts_with([';', ':']))
-        {
-            if let Some(colon_pos) = line.find(':') {
-                let value = line[colon_pos + 1..].trim().to_string();
-                if !value.is_empty() {
-                    return Some(value);
-                }
+        let Some(rest) = line.strip_prefix(field) else {
+            continue;
+        };
+        if !rest.starts_with([';', ':']) {
+            continue;
+        }
+        if let Some((_, value)) = crate::timezone::params_and_value(rest) {
+            let value = value.trim().to_string();
+            if !value.is_empty() {
+                return Some(value);
             }
         }
     }
@@ -86,8 +87,10 @@ pub(crate) fn unfold_ical(ical: &str) -> String {
 /// - `DTSTART:20260310T100000Z` → `Some("UTC")`
 /// - `DTSTART:20260310T100000` (no TZID, no Z) → `None` (floating/local)
 /// - `DTSTART;VALUE=DATE:20260310` → `None` (all-day)
+///
+/// Unfolds RFC 5545 line folds and keeps quoted TZIDs that contain `:`.
 pub fn extract_vevent_tzid(vevent: &str, field: &str) -> Option<String> {
-    for line in vevent.lines() {
+    for line in unfold_ical(vevent).lines() {
         if !line.starts_with(field) {
             continue;
         }
@@ -101,31 +104,24 @@ pub fn extract_vevent_tzid(vevent: &str, field: &str) -> Option<String> {
             continue;
         }
 
-        // Check for VALUE=DATE (all-day) — no timezone
-        if rest.contains("VALUE=DATE") {
+        let Some((params, value)) = crate::timezone::params_and_value(rest) else {
+            return None;
+        };
+        // VALUE=DATE-TIME must not be treated as all-day (it contains "VALUE=DATE").
+        if params
+            .iter()
+            .any(|(k, v)| k.eq_ignore_ascii_case("VALUE") && v.eq_ignore_ascii_case("DATE"))
+        {
             return None;
         }
-
-        // Check for TZID= parameter
-        if let Some(tzid_pos) = rest.find("TZID=") {
-            let after_tzid = &rest[tzid_pos + 5..];
-            // TZID value ends at ':' or ';'
-            let end = after_tzid.find([':', ';']).unwrap_or(after_tzid.len());
-            let tz = after_tzid[..end].trim().trim_matches('"');
+        if let Some((_, tz)) = params.iter().find(|(k, _)| k.eq_ignore_ascii_case("TZID")) {
             if !tz.is_empty() {
-                return Some(tz.to_string());
+                return Some(tz.clone());
             }
         }
-
-        // Check for trailing Z (UTC)
-        if let Some(colon_pos) = rest.find(':') {
-            let value = rest[colon_pos + 1..].trim();
-            if value.ends_with('Z') {
-                return Some("UTC".to_string());
-            }
+        if value.trim().ends_with('Z') {
+            return Some("UTC".to_string());
         }
-
-        // No TZID, no Z → floating
         return None;
     }
     None
@@ -133,18 +129,18 @@ pub fn extract_vevent_tzid(vevent: &str, field: &str) -> Option<String> {
 
 /// Convert a NaiveDateTime from the event's timezone to the target timezone.
 ///
-/// - If `event_tz` is `Some` and a valid IANA timezone → convert
+/// - If `event_tz` is `Some` and resolves (IANA, Windows, Microsoft URI) → convert
 /// - If `None` (floating) → return as-is (backward-compatible)
-/// - If IANA parse fails → return as-is (graceful degradation)
+/// - If resolution fails → return as-is (graceful degradation)
 pub fn convert_event_to_tz(
     dt: NaiveDateTime,
     event_tz: Option<&str>,
     target_tz: Tz,
 ) -> NaiveDateTime {
     let etz: Tz = match event_tz {
-        Some(tz_str) => match tz_str.parse::<Tz>() {
-            Ok(tz) => tz,
-            Err(_) => return dt,
+        Some(tz_str) => match crate::timezone::resolve_tzid(tz_str) {
+            Some(tz) => tz,
+            None => return dt,
         },
         None => return dt,
     };
@@ -318,6 +314,15 @@ END:VCALENDAR";
     }
 
     #[test]
+    fn extract_field_quoted_tzid_with_colons() {
+        let vevent = "BEGIN:VEVENT\nDTSTART;TZID=\"tzone://Microsoft/Olson/Europe/Paris\":20260310T100000\nEND:VEVENT";
+        assert_eq!(
+            extract_vevent_field(vevent, "DTSTART"),
+            Some("20260310T100000".to_string())
+        );
+    }
+
+    #[test]
     fn extract_nonexistent_field() {
         let vevent = "BEGIN:VEVENT\nUID:abc\nEND:VEVENT";
         assert_eq!(extract_vevent_field(vevent, "SUMMARY"), None);
@@ -396,6 +401,53 @@ END:VCALENDAR";
         assert_eq!(extract_vevent_tzid(vevent, "DTSTART"), None); // floating, not the -EXTRA line
     }
 
+    #[test]
+    fn tzid_quoted_microsoft_uri_keeps_colons() {
+        let vevent = "BEGIN:VEVENT\nDTSTART;TZID=\"tzone://Microsoft/Olson/Europe/Paris\":20260310T100000\nEND:VEVENT";
+        assert_eq!(
+            extract_vevent_tzid(vevent, "DTSTART"),
+            Some("tzone://Microsoft/Olson/Europe/Paris".to_string())
+        );
+    }
+
+    #[test]
+    fn tzid_unquoted_microsoft_uri_does_not_truncate_at_first_colon() {
+        let vevent =
+            "BEGIN:VEVENT\nDTSTART;TZID=tzone://Microsoft/Olson/Europe/Paris:20260310T100000\nEND:VEVENT";
+        assert_eq!(
+            extract_vevent_tzid(vevent, "DTSTART"),
+            Some("tzone://Microsoft/Olson/Europe/Paris".to_string())
+        );
+    }
+
+    #[test]
+    fn tzid_windows_name() {
+        let vevent = "BEGIN:VEVENT\nDTSTART;TZID=Romance Standard Time:20260310T100000\nEND:VEVENT";
+        assert_eq!(
+            extract_vevent_tzid(vevent, "DTSTART"),
+            Some("Romance Standard Time".to_string())
+        );
+    }
+
+    #[test]
+    fn tzid_folded_across_iana_name() {
+        let vevent = "BEGIN:VEVENT\nDTSTART;TZID=Europe/\n Paris:20260310T100000\nEND:VEVENT";
+        assert_eq!(
+            extract_vevent_tzid(vevent, "DTSTART"),
+            Some("Europe/Paris".to_string())
+        );
+    }
+
+    #[test]
+    fn tzid_value_date_time_is_not_all_day() {
+        let vevent =
+            "BEGIN:VEVENT\nDTSTART;TZID=Europe/Paris;VALUE=DATE-TIME:20260310T100000\nEND:VEVENT";
+        assert_eq!(
+            extract_vevent_tzid(vevent, "DTSTART"),
+            Some("Europe/Paris".to_string())
+        );
+    }
+
     // --- convert_event_to_tz ---
 
     #[test]
@@ -450,6 +502,21 @@ END:VCALENDAR";
             "Europe/Paris".parse::<Tz>().unwrap(),
         );
         assert_eq!(result, dt); // unchanged
+    }
+
+    #[test]
+    fn convert_windows_eastern_to_paris() {
+        use chrono::NaiveDate;
+        let dt = NaiveDate::from_ymd_opt(2026, 7, 15)
+            .unwrap()
+            .and_hms_opt(10, 0, 0)
+            .unwrap();
+        let result = convert_event_to_tz(
+            dt,
+            Some("Eastern Standard Time"),
+            "Europe/Paris".parse::<Tz>().unwrap(),
+        );
+        assert_eq!(result.hour(), 16);
     }
 
     // --- render_inline_markdown ---

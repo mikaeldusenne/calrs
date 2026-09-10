@@ -25,6 +25,7 @@ mod sync_diagnostics;
 mod sync_jobs;
 #[cfg(test)]
 mod test_support;
+mod timezone;
 mod utils;
 mod web;
 

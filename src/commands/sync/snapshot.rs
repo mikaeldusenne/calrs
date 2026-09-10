@@ -248,6 +248,7 @@ async fn store_events(conn: &mut SqliteConnection, calendar_id: &str, ical: &str
         return Err(SyncFailure::new("invalid_calendar").into());
     }
     let resource_uid = field(&blocks[0], "UID");
+    let vtz = crate::timezone::VTimezones::parse(ical);
     for event in blocks {
         let required = |name| {
             field(&event, name)
@@ -280,25 +281,19 @@ async fn store_events(conn: &mut SqliteConnection, calendar_id: &str, ical: &str
         } else {
             start.clone() // RFC 5545: a timed event without DTEND/DURATION is instantaneous.
         };
-        let tz = extract_vevent_tzid(&event, "DTSTART");
-        let end_tz = extract_vevent_tzid(&event, "DTEND");
-        if [&tz, &end_tz].iter().any(|tz| {
-            tz.as_deref()
-                .is_some_and(|tz| tz.parse::<chrono_tz::Tz>().is_err())
-        }) {
-            return Err(SyncFailure::new("unsupported_timezone").into());
-        }
+        let tz =
+            crate::timezone::accept_tzid(extract_vevent_tzid(&event, "DTSTART").as_deref(), &vtz)
+                .map_err(|code| SyncFailure::new(code))?;
+        let end_tz =
+            crate::timezone::accept_tzid(extract_vevent_tzid(&event, "DTEND").as_deref(), &vtz)
+                .map_err(|code| SyncFailure::new(code))?;
         let mut end_dt =
             parse_ical_datetime(&end).ok_or_else(|| SyncFailure::new("invalid_calendar"))?;
         if let (Some(start_tz), Some(end_tz)) = (&tz, &end_tz) {
             if start_tz != end_tz {
-                end_dt = crate::utils::convert_event_to_tz(
-                    end_dt,
-                    Some(end_tz),
-                    start_tz
-                        .parse()
-                        .map_err(|_| SyncFailure::new("unsupported_timezone"))?,
-                );
+                let start_zone = crate::timezone::resolve_tzid(start_tz)
+                    .ok_or_else(|| SyncFailure::new("unsupported_timezone"))?;
+                end_dt = crate::utils::convert_event_to_tz(end_dt, Some(end_tz), start_zone);
                 end = end_dt.format("%Y%m%dT%H%M%S").to_string();
             }
         }
@@ -312,22 +307,28 @@ async fn store_events(conn: &mut SqliteConnection, calendar_id: &str, ical: &str
         // An unrecognised exclusion TZ must not accidentally suppress a real
         // occurrence at the same wall-clock time in a different timezone.
         for line in event.lines() {
-            let Some((header, values)) = line.split_once(':') else {
+            let property = if line.starts_with("EXDATE") {
+                "EXDATE"
+            } else if line.starts_with("RECURRENCE-ID") {
+                "RECURRENCE-ID"
+            } else {
                 continue;
             };
-            let property = header.split(';').next().unwrap_or("");
-            if !matches!(property, "EXDATE" | "RECURRENCE-ID") {
+            let rest = &line[property.len()..];
+            if rest.is_empty() || !matches!(rest.as_bytes()[0], b';' | b':') {
                 continue;
             }
+            let Some((params, values)) = crate::timezone::params_and_value(rest) else {
+                return Err(SyncFailure::new("invalid_recurrence").into());
+            };
+            let ex_tz = params
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("TZID"))
+                .map(|(_, v)| v.as_str());
+            crate::timezone::accept_tzid(ex_tz, &vtz).map_err(|code| SyncFailure::new(code))?;
             for value in values.split(',') {
                 if parse_ical_datetime(value).is_none() {
                     return Err(SyncFailure::new("invalid_recurrence").into());
-                }
-                let as_start = format!("DTSTART{}:{value}", &header[property.len()..]);
-                if extract_vevent_tzid(&as_start, "DTSTART")
-                    .is_some_and(|s| s.parse::<chrono_tz::Tz>().is_err())
-                {
-                    return Err(SyncFailure::new("unsupported_timezone").into());
                 }
             }
         }

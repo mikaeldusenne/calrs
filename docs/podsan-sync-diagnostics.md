@@ -66,8 +66,11 @@ an empty calendar. Users with no calendar source keep their existing behavior.
 The reminder loop proactively queues stale sources; guest pages also enqueue
 without waiting for Exchange. SQL read failures block availability.
 
-Unsupported sub-daily rules, RDATE/RANGE=THISANDFUTURE and unknown timezone
-identifiers fail explicitly; they must not silently become free time. An expansion
+Unsupported sub-daily rules, RDATE/RANGE=THISANDFUTURE and timezone identifiers
+that are neither IANA, a Windows/CLDR name, a Microsoft/libical Olson URI, nor
+defined by a VTIMEZONE in the same resource fail explicitly; they must not
+silently become free time. DavMail/Exchange TZIDs such as `Romance Standard Time`
+are mapped to IANA (`Europe/Paris`) and stored under that name. An expansion
 safety limit blocks the requested period and emits `recurrence_limit` metadata.
 The new status UI is provided in French and English; other shipped locales
 currently contain explicitly marked English copy.
