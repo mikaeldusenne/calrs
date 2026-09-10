@@ -323,6 +323,55 @@ async fn microsoft_olson_uri_is_stored_as_iana() {
 }
 
 #[tokio::test]
+async fn outlook_and_davmail_timezones_preserve_the_complete_series() {
+    // Reproduce the reported Outlook export, retaining dates/rules but no private data.
+    let ical = "BEGIN:VCALENDAR\nPRODID:-//Microsoft Corporation//Outlook 16.0 MIMEDIR//EN\nVERSION:2.0\nMETHOD:PUBLISH\nX-MS-OLK-FORCEINSPECTOROPEN:TRUE\nBEGIN:VTIMEZONE\nTZID:Customized Time Zone\nBEGIN:STANDARD\nDTSTART:16011028T030000\nRRULE:FREQ=YEARLY;BYDAY=-1SU;BYMONTH=10\nTZOFFSETFROM:+0200\nTZOFFSETTO:+0100\nEND:STANDARD\nBEGIN:DAYLIGHT\nDTSTART:16010325T020000\nRRULE:FREQ=YEARLY;BYDAY=-1SU;BYMONTH=3\nTZOFFSETFROM:+0100\nTZOFFSETTO:+0200\nEND:DAYLIGHT\nEND:VTIMEZONE\nBEGIN:VEVENT\nCLASS:PUBLIC\nCREATED:20260910T110153Z\nDTEND;TZID=\"Customized Time Zone\":20250721T100000\nDTSTAMP:20260910T110153Z\nDTSTART;TZID=\"Customized Time Zone\":20250721T090000\nLAST-MODIFIED:20260910T110153Z\nPRIORITY:5\nRRULE:FREQ=WEEKLY;COUNT=4;INTERVAL=4;BYDAY=MO;WKST=MO\nSEQUENCE:0\nSUMMARY;LANGUAGE=fr:Test Outlook event\nTRANSP:OPAQUE\nUID:synthetic-\n\toutlook-series\nX-ALT-DESC;FMTTYPE=text/html:<HTML>\n\t<BODY>Test</BODY></HTML>\nX-MICROSOFT-CDO-BUSYSTATUS:BUSY\nX-MICROSOFT-CDO-IMPORTANCE:1\nX-MS-OLK-AUTOFILLLOCATION:TRUE\nEND:VEVENT\nEND:VCALENDAR\n";
+    // Exact VTIMEZONE captured from DavMail; event details are synthetic.
+    let davmail = include_str!("../../../../tests/fixtures/davmail-custom-timezone.ics");
+    for ical in [ical, davmail]
+        .into_iter()
+        .flat_map(|ical| [ical.to_string(), ical.replace('\n', "\r\n")])
+    {
+        let pool = stored_calendar(&ical).await.expect("valid calendar series");
+        let recurring: Vec<(String, String, String, Option<String>, Option<String>)> =
+            sqlx::query_as("SELECT start_at, end_at, rrule, raw_ical, timezone FROM events")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        let date = |s: &str| parse_ical_datetime(s).unwrap();
+        let busy = crate::web::expand_recurring_into_busy(
+            &recurring,
+            date("20250701T000000"),
+            date("20251101T000000"),
+            chrono_tz::UTC,
+        );
+        assert_eq!(
+            busy,
+            ["20250721", "20250818", "20250915", "20251013"]
+                .map(|d| (date(&format!("{d}T070000")), date(&format!("{d}T080000"))))
+        );
+        assert!(crate::web::expand_recurring_into_busy(
+            &recurring,
+            date("20260901T000000"),
+            date("20261001T000000"),
+            chrono_tz::UTC
+        )
+        .is_empty());
+    }
+}
+
+#[tokio::test]
+async fn active_timezone_collision_still_rejects_the_event() {
+    let ical = include_str!("../../../../tests/fixtures/davmail-custom-timezone.ics")
+        .replace("END:STANDARD", "RDATE:20250721T030000\nEND:STANDARD")
+        .replace("END:DAYLIGHT", "RDATE:20250721T020000\nEND:DAYLIGHT");
+    assert_eq!(
+        stored_timezone(&ical).await.unwrap_err(),
+        "unsupported_timezone"
+    );
+}
+
+#[tokio::test]
 async fn vtimezone_without_iana_location_uses_its_actual_offset() {
     let ical = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VTIMEZONE\r\nTZID:Customized Time Zone\r\nBEGIN:STANDARD\r\nDTSTART:16010101T000000\r\nTZOFFSETFROM:+0100\r\nTZOFFSETTO:+0100\r\nEND:STANDARD\r\nEND:VTIMEZONE\r\nBEGIN:VEVENT\r\nUID:custom-1\r\nDTSTART;TZID=Customized Time Zone:20260310T100000\r\nDTEND;TZID=Customized Time Zone:20260310T110000\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
     for ical in [
