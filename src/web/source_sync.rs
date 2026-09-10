@@ -76,6 +76,7 @@ struct Status {
     sync_http_status: Option<i64>,
     sync_verified_at: Option<String>,
     sync_started_at: Option<String>,
+    sync_event_error: Option<String>,
     elapsed: i64,
     needs_setup: bool,
 }
@@ -85,22 +86,26 @@ pub(super) async fn status(
     user: crate::auth::AuthUser,
     Path(id): Path<String>,
 ) -> Response {
-    if !owned(&state, &user, &id).await {
-        return StatusCode::NOT_FOUND.into_response();
-    }
     if crate::sync_jobs::expire(&state.pool).await.is_err() {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
     let job = sqlx::query_as::<_, Status>("SELECT name, sync_status, sync_id, sync_stage, sync_error,
-        sync_http_status, sync_verified_at, sync_started_at,
+        sync_http_status, sync_verified_at, sync_started_at, sync_event_error,
         COALESCE(unixepoch(COALESCE(sync_finished_at, datetime('now'))) - unixepoch(sync_started_at), 0) AS elapsed,
         write_calendar_href IS NULL AND EXISTS (SELECT 1 FROM calendars WHERE source_id = cs.id) AS needs_setup
-        FROM caldav_sources cs WHERE id = ?")
-        .bind(&id).fetch_one(&state.pool).await;
-    let Ok(job) = job else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        FROM caldav_sources cs WHERE id = ?
+        AND EXISTS (SELECT 1 FROM accounts a WHERE a.id = cs.account_id AND a.user_id = ?)")
+        .bind(&id).bind(&user.user.id).fetch_optional(&state.pool).await;
+    let job = match job {
+        Ok(Some(job)) => job,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
     let active = matches!(job.sync_status.as_str(), "queued" | "running");
+    let event_error = job
+        .sync_event_error
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<crate::sync_diagnostics::EventFailure>(s).ok());
     let tmpl = match state.templates.get_template("source_sync.html") {
         Ok(t) => t,
         Err(e) => return internal_error_html("template render", &e).into_response(),
@@ -122,7 +127,7 @@ pub(super) async fn status(
             .replace('_', "-")
     );
     let html = tmpl.render(context! { job => job, source_id => id, active => active,
-        state_key => state_key, stage_key => stage_key, error_key => error_key,
+        state_key => state_key, stage_key => stage_key, error_key => error_key, event_error => event_error,
         sidebar => sidebar_context(&user, "sources"), lang => user.lang,
         impersonating => impersonating, impersonating_name => impersonating_name,
     });

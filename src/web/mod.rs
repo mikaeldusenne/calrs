@@ -12565,10 +12565,8 @@ pub(crate) fn expand_recurring_into_busy(
     let mut result = Vec::new();
     for (s, e, rrule_str, raw_ical, event_tz) in recurring {
         if let (Some(ev_start), Some(ev_end)) = (parse_ical_datetime(s), parse_ical_datetime(e)) {
-            let event_zone = match crate::timezone::VTimezones::default()
-                .resolve(event_tz.as_deref())
-            {
-                Ok(zone) => zone.unwrap_or(host_tz),
+            let event_zone = match crate::timezone::resolve_stored(event_tz.as_deref()) {
+                Ok(zone) => zone.unwrap_or(crate::timezone::Zone::Iana(host_tz)),
                 Err(code) => {
                     tracing::warn!(target: crate::sync_diagnostics::TARGET, error_kind = code, "availability blocked");
                     return vec![(window_start, window_end)];
@@ -12576,7 +12574,7 @@ pub(crate) fn expand_recurring_into_busy(
             };
             let exdates = raw_ical
                 .as_deref()
-                .map(|ical| crate::rrule::extract_exdates_in_tz(ical, Some(event_zone)))
+                .map(|ical| crate::rrule::extract_exdates_for_zone(ical, Some(&event_zone)))
                 .transpose();
             let exdates = match exdates {
                 Ok(dates) => dates.unwrap_or_default(),
@@ -12584,6 +12582,35 @@ pub(crate) fn expand_recurring_into_busy(
                     tracing::warn!(target: crate::sync_diagnostics::TARGET, error_kind = crate::sync_diagnostics::error_kind(&error), "availability blocked");
                     return vec![(window_start, window_end)];
                 }
+            };
+            let crate::timezone::Zone::Iana(event_zone) = event_zone else {
+                let window = host_tz
+                    .from_local_datetime(&window_start)
+                    .earliest()
+                    .zip(host_tz.from_local_datetime(&window_end).latest());
+                let Some((start, end)) = window else {
+                    return vec![(window_start, window_end)];
+                };
+                match crate::rrule::expand_custom(
+                    ev_start,
+                    ev_end,
+                    rrule_str,
+                    &exdates,
+                    (start.naive_utc(), end.naive_utc()),
+                    &event_zone,
+                ) {
+                    Ok(busy) => result.extend(busy.into_iter().map(|(s, e)| {
+                        (
+                            s.and_utc().with_timezone(&host_tz).naive_local(),
+                            e.and_utc().with_timezone(&host_tz).naive_local(),
+                        )
+                    })),
+                    Err(error) => {
+                        tracing::warn!(target: crate::sync_diagnostics::TARGET, error_kind = crate::sync_diagnostics::error_kind(&error), "availability blocked");
+                        return vec![(window_start, window_end)];
+                    }
+                }
+                continue;
             };
             // Expand RRULE in the event's own timezone (correct for DST)
             let occurrences = crate::rrule::expand_rrule_in_tz(
@@ -12718,14 +12745,19 @@ async fn fetch_busy_times_for_user_ex(
         Err(_) => return vec![(window_start, window_end)],
     };
 
-    let mut busy: Vec<(NaiveDateTime, NaiveDateTime)> = events
+    let busy: Option<Vec<(NaiveDateTime, NaiveDateTime)>> = events
         .iter()
-        .filter_map(|(s, e, tz)| {
-            let start = convert_event_to_tz(parse_ical_datetime(s)?, tz.as_deref(), host_tz);
-            let end = convert_event_to_tz(parse_ical_datetime(e)?, tz.as_deref(), host_tz);
+        .map(|(s, e, tz)| {
+            let start =
+                crate::utils::checked_event_to_tz(parse_ical_datetime(s)?, tz.as_deref(), host_tz)?;
+            let end =
+                crate::utils::checked_event_to_tz(parse_ical_datetime(e)?, tz.as_deref(), host_tz)?;
             Some((start, end))
         })
         .collect();
+    let Some(mut busy) = busy else {
+        return vec![(window_start, window_end)];
+    };
 
     let end_compact_rrule = (window_end + Duration::days(2))
         .format("%Y%m%dT235959")
@@ -29558,6 +29590,55 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn sync_error_event_is_owner_only_escaped_and_not_cached() {
+        let (app, pool, session, _) = setup_test_app().await;
+        let sid = seed_source(&pool, "Calendar", "PRIVATE-PASSWORD").await;
+        let detail = crate::sync_diagnostics::EventFailure::from_event(
+            "BEGIN:VEVENT\nUID:private-event-id\nSUMMARY:Meeting <script>alert(1)</script>\nDTSTART;TZID=Opaque:20260715T100000\nDESCRIPTION:EMAIL_BODY_SECRET\nEND:VEVENT");
+        sqlx::query("UPDATE caldav_sources SET sync_status = 'failed', sync_error = 'unsupported_timezone', sync_event_error = ? WHERE id = ?")
+            .bind(serde_json::to_string(&detail).unwrap()).bind(&sid).execute(&pool).await.unwrap();
+        let uri = format!("/dashboard/sources/{sid}/sync");
+        let response = app
+            .clone()
+            .oneshot(get_authed(&uri, &session))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        let body = body_string(response).await;
+        assert!(body.contains("Meeting &lt;script&gt;alert(1)&lt;&#x2f;script&gt;"));
+        assert!(body.contains("2026-07-15 10:00:00"));
+        assert!(body.contains("Opaque"));
+        assert!(body.contains("private-event-id"));
+        assert!(!body.contains("<script>alert(1)</script>"));
+        assert!(!body.contains("EMAIL_BODY_SECRET"));
+        let anonymous = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(&uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(!body_string(anonymous).await.contains("private-event-id"));
+        sqlx::query("UPDATE accounts SET user_id = NULL WHERE id = (SELECT account_id FROM caldav_sources WHERE id = ?)")
+            .bind(&sid).execute(&pool).await.unwrap();
+        assert!(sqlx::query_scalar::<_, Option<String>>(
+            "SELECT sync_event_error FROM caldav_sources WHERE id = ?"
+        )
+        .bind(&sid)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .is_none());
+        let denied = app.oneshot(get_authed(&uri, &session)).await.unwrap();
+        assert_eq!(denied.status(), 404);
+        assert!(!body_string(denied).await.contains("private-event-id"));
     }
 
     #[test]

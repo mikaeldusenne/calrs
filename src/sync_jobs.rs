@@ -70,13 +70,14 @@ async fn enqueue_with_deadline(
     expire(pool).await?;
     let sync_id = uuid::Uuid::new_v4().to_string();
     let automatic = matches!(trigger, "background" | "on_demand");
-    let claimed = sqlx::query(
+    let revision = sqlx::query_scalar::<_, i64>(
         "UPDATE caldav_sources SET sync_status = 'queued', sync_stage = 'queued', sync_id = ?,
-           sync_started_at = datetime('now'), sync_finished_at = NULL
+           sync_started_at = datetime('now'), sync_finished_at = NULL, sync_event_error = NULL
          WHERE id = ? AND enabled = 1 AND sync_status NOT IN ('queued', 'running')
-           AND (? = 0 OR sync_finished_at IS NULL OR sync_finished_at < datetime('now', '-60 seconds'))"
-    ).bind(&sync_id).bind(source_id).bind(automatic).execute(pool).await?.rows_affected();
-    if claimed == 0 {
+           AND (? = 0 OR sync_finished_at IS NULL OR sync_finished_at < datetime('now', '-60 seconds'))
+         RETURNING sync_revision"
+    ).bind(&sync_id).bind(source_id).bind(automatic).fetch_optional(pool).await?;
+    let Some(revision) = revision else {
         return Ok(sqlx::query_scalar::<_, Option<String>>(
             "SELECT sync_id FROM caldav_sources WHERE id = ?",
         )
@@ -84,7 +85,7 @@ async fn enqueue_with_deadline(
         .fetch_one(pool)
         .await?
         .unwrap_or_default());
-    }
+    };
 
     let context = Context {
         pool: pool.clone(),
@@ -111,11 +112,16 @@ async fn enqueue_with_deadline(
             Ok(()) => ("ok", None, None),
             Err(error) => ("failed", Some(diagnostics::error_kind(error)), diagnostics::http_status(error)),
         };
+        let event_error = result.as_ref().err()
+            .and_then(|e| e.downcast_ref::<diagnostics::EventFailure>())
+            .and_then(|event| serde_json::to_string(event).ok());
         tracing::info!(target: diagnostics::TARGET, outcome = status, error_kind = error,
             http_status, "background sync finished");
         if sqlx::query("UPDATE caldav_sources SET sync_status = ?, sync_error = ?, sync_http_status = ?,
+                          sync_event_error = CASE WHEN sync_revision = ? THEN ? END,
                           sync_finished_at = datetime('now') WHERE id = ? AND sync_id = ?")
             .bind(status).bind(error).bind(http_status.map(i64::from))
+            .bind(revision).bind(event_error)
             .bind(&source_id).bind(&sync_id).execute(&pool).await.is_err() {
             tracing::error!(target: diagnostics::TARGET, error_kind = "database", "could not record sync result");
         }
@@ -242,6 +248,52 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(finished(&pool).await.0, "ok");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn event_error_is_saved_privately_and_cleared_on_retry_and_reconfiguration() {
+        let (pool, _, mock, server) = fixture().await;
+        mock.mode.store(6, Ordering::SeqCst);
+        enqueue(&pool, &[0; 32], "s", false, "dashboard")
+            .await
+            .unwrap();
+        assert_eq!(
+            finished(&pool).await.1.as_deref(),
+            Some("unsupported_timezone")
+        );
+        let raw: String =
+            sqlx::query_scalar("SELECT sync_event_error FROM caldav_sources WHERE id = 's'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let detail: diagnostics::EventFailure = serde_json::from_str(&raw).unwrap();
+        assert_eq!(detail.title.as_deref(), Some("Private calendar event"));
+        assert_eq!(detail.timezones, vec!["Opaque"]);
+        assert!(!format!("{detail:?}").contains("Private calendar event"));
+        sqlx::query("UPDATE caldav_sources SET username = 'changed' WHERE id = 's'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(sqlx::query_scalar::<_, Option<String>>(
+            "SELECT sync_event_error FROM caldav_sources WHERE id = 's'"
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .is_none());
+        mock.mode.store(0, Ordering::SeqCst);
+        enqueue(&pool, &[0; 32], "s", false, "dashboard")
+            .await
+            .unwrap();
+        assert_eq!(finished(&pool).await.0, "ok");
+        assert!(sqlx::query_scalar::<_, Option<String>>(
+            "SELECT sync_event_error FROM caldav_sources WHERE id = 's'"
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .is_none());
         server.abort();
     }
 

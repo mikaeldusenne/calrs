@@ -236,7 +236,7 @@ async fn publish(
 }
 
 /// Reject data we cannot safely use for availability instead of silently
-/// inventing UIDs or losing busy periods. Errors contain only fixed codes.
+/// inventing UIDs or losing busy periods. Private event context never enters logs.
 async fn store_events(conn: &mut SqliteConnection, calendar_id: &str, ical: &str) -> Result<()> {
     let unfolded = crate::utils::unfold_ical(ical);
     let ical = unfolded.as_str();
@@ -245,92 +245,119 @@ async fn store_events(conn: &mut SqliteConnection, calendar_id: &str, ical: &str
         || !ical.contains("END:VCALENDAR")
         || ical.matches("BEGIN:VEVENT").count() != ical.matches("END:VEVENT").count()
     {
-        return Err(SyncFailure::new("invalid_calendar").into());
+        return Err(anyhow::Error::from(SyncFailure::new("invalid_calendar"))
+            .context(diagnostics::EventFailure::from_event(ical)));
     }
     let resource_uid = field(&blocks[0], "UID");
     let vtz = crate::timezone::VTimezones::parse(ical);
-    // Use the same parser/resolver as availability; validate all overrides too.
-    crate::rrule::extract_exdates_in_tz(ical, None)?;
+    // Attribute malformed exclusions to their own override, not the series master.
+    for event in &blocks {
+        crate::rrule::extract_exdates_using(event, None, &vtz)
+            .map_err(|e| e.context(diagnostics::EventFailure::from_event(event)))?;
+    }
     for event in blocks {
-        let required = |name| {
-            field(&event, name)
-                .filter(|s| !s.is_empty())
-                .ok_or_else(|| SyncFailure::new("invalid_calendar"))
-        };
-        let uid = required("UID")?;
-        if Some(&uid) != resource_uid.as_ref() {
-            return Err(SyncFailure::new("invalid_calendar").into());
-        }
-        let start = field(&event, "DTSTART")
-            .or_else(|| {
-                (field(&event, "STATUS").as_deref() == Some("CANCELLED"))
-                    .then(|| field(&event, "RECURRENCE-ID"))
-                    .flatten()
-            })
-            .ok_or_else(|| SyncFailure::new("invalid_calendar"))?;
-        let start_dt =
-            parse_ical_datetime(&start).ok_or_else(|| SyncFailure::new("invalid_calendar"))?;
-        let mut end = if let Some(end) = field(&event, "DTEND") {
-            end
-        } else if let Some(duration) = field(&event, "DURATION") {
-            start_dt
-                .checked_add_signed(parse_duration(&duration)?)
-                .ok_or_else(|| SyncFailure::new("invalid_calendar"))?
-                .format("%Y%m%dT%H%M%S")
-                .to_string()
-        } else if start.len() == 8 {
-            (start_dt + Duration::days(1)).format("%Y%m%d").to_string()
-        } else {
-            start.clone() // RFC 5545: a timed event without DTEND/DURATION is instantaneous.
-        };
-        let tz =
-            crate::timezone::accept_tzid(extract_vevent_tzid(&event, "DTSTART").as_deref(), &vtz)
-                .map_err(SyncFailure::new)?;
-        let end_tz =
-            crate::timezone::accept_tzid(extract_vevent_tzid(&event, "DTEND").as_deref(), &vtz)
-                .map_err(SyncFailure::new)?;
-        let mut end_dt =
-            parse_ical_datetime(&end).ok_or_else(|| SyncFailure::new("invalid_calendar"))?;
-        if let (Some(start_tz), Some(end_tz)) = (&tz, &end_tz) {
-            if start_tz != end_tz {
-                let start_zone = crate::timezone::resolve_tzid(start_tz)
-                    .ok_or_else(|| SyncFailure::new("unsupported_timezone"))?;
-                end_dt = crate::utils::convert_event_to_tz(end_dt, Some(end_tz), start_zone);
-                end = end_dt.format("%Y%m%dT%H%M%S").to_string();
+        let result: Result<()> = async {
+            let required = |name| {
+                field(&event, name)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| SyncFailure::new("invalid_calendar"))
+            };
+            let uid = required("UID")?;
+            if Some(&uid) != resource_uid.as_ref() {
+                return Err(SyncFailure::new("invalid_calendar").into());
             }
-        }
-        if end_dt < start_dt {
-            return Err(SyncFailure::new("invalid_calendar").into());
-        }
-        // RANGE changes later instances, not just this one: don't misinterpret it.
-        if event.contains("RANGE=THISANDFUTURE") || field(&event, "RDATE").is_some() {
-            return Err(SyncFailure::new("unsupported_recurrence").into());
-        }
-        let rule = field(&event, "RRULE");
-        if let Some(rule) = &rule {
-            crate::rrule::validate(start_dt, rule, tz.as_deref())?;
-        }
-        sqlx::query(
-            "INSERT INTO events (id, calendar_id, uid, summary, start_at, end_at,
+            let start = field(&event, "DTSTART")
+                .or_else(|| {
+                    (field(&event, "STATUS").as_deref() == Some("CANCELLED"))
+                        .then(|| field(&event, "RECURRENCE-ID"))
+                        .flatten()
+                })
+                .ok_or_else(|| SyncFailure::new("invalid_calendar"))?;
+            let start_dt =
+                parse_ical_datetime(&start).ok_or_else(|| SyncFailure::new("invalid_calendar"))?;
+            let mut end = if let Some(end) = field(&event, "DTEND") {
+                end
+            } else if let Some(duration) = field(&event, "DURATION") {
+                start_dt
+                    .checked_add_signed(parse_duration(&duration)?)
+                    .ok_or_else(|| SyncFailure::new("invalid_calendar"))?
+                    .format("%Y%m%dT%H%M%S")
+                    .to_string()
+            } else if start.len() == 8 {
+                (start_dt + Duration::days(1)).format("%Y%m%d").to_string()
+            } else {
+                start.clone() // RFC 5545: a timed event without DTEND/DURATION is instantaneous.
+            };
+            let tz = crate::timezone::accept_tzid(
+                extract_vevent_tzid(&event, "DTSTART").as_deref(),
+                &vtz,
+            )
+            .map_err(SyncFailure::new)?;
+            let end_tz =
+                crate::timezone::accept_tzid(extract_vevent_tzid(&event, "DTEND").as_deref(), &vtz)
+                    .map_err(SyncFailure::new)?;
+            let mut end_dt =
+                parse_ical_datetime(&end).ok_or_else(|| SyncFailure::new("invalid_calendar"))?;
+            if let (Some(start_tz), Some(end_tz)) = (&tz, &end_tz) {
+                if start_tz != end_tz {
+                    let start_zone = crate::timezone::resolve_stored(Some(start_tz))
+                        .map_err(SyncFailure::new)?
+                        .ok_or_else(|| SyncFailure::new("unsupported_timezone"))?;
+                    let end_zone = crate::timezone::resolve_stored(Some(end_tz))
+                        .map_err(SyncFailure::new)?
+                        .ok_or_else(|| SyncFailure::new("unsupported_timezone"))?;
+                    end_dt = start_zone
+                        .to_local(end_zone.to_utc(end_dt).map_err(SyncFailure::new)?)
+                        .map_err(SyncFailure::new)?;
+                    end = end_dt.format("%Y%m%dT%H%M%S").to_string();
+                }
+            }
+            if end_dt < start_dt {
+                return Err(SyncFailure::new("invalid_calendar").into());
+            }
+            // RANGE changes later instances, not just this one: don't misinterpret it.
+            if event.contains("RANGE=THISANDFUTURE") || field(&event, "RDATE").is_some() {
+                return Err(SyncFailure::new("unsupported_recurrence").into());
+            }
+            let rule = field(&event, "RRULE");
+            if let Some(rule) = &rule {
+                crate::rrule::validate(start_dt, rule, tz.as_deref())?;
+            }
+            // Validate custom transitions now as well as at the (possibly ancient)
+            // DTSTART, so malformed observances are reported during synchronization.
+            if let Some(zone @ crate::timezone::Zone::Custom(_)) =
+                crate::timezone::resolve_stored(tz.as_deref()).map_err(SyncFailure::new)?
+            {
+                zone.to_utc(start_dt).map_err(SyncFailure::new)?;
+                zone.to_utc(end_dt).map_err(SyncFailure::new)?;
+                zone.to_local(Utc::now().naive_utc())
+                    .map_err(SyncFailure::new)?;
+            }
+            sqlx::query(
+                "INSERT INTO events (id, calendar_id, uid, summary, start_at, end_at,
             location, description, status, rrule, raw_ical, recurrence_id, timezone, transp)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(uuid::Uuid::new_v4().to_string())
-        .bind(calendar_id)
-        .bind(uid)
-        .bind(field(&event, "SUMMARY"))
-        .bind(start)
-        .bind(end)
-        .bind(field(&event, "LOCATION"))
-        .bind(field(&event, "DESCRIPTION"))
-        .bind(field(&event, "STATUS"))
-        .bind(rule)
-        .bind(ical)
-        .bind(field(&event, "RECURRENCE-ID"))
-        .bind(tz)
-        .bind(field(&event, "TRANSP"))
-        .execute(&mut *conn)
-        .await?;
+            )
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(calendar_id)
+            .bind(uid)
+            .bind(field(&event, "SUMMARY"))
+            .bind(start)
+            .bind(end)
+            .bind(field(&event, "LOCATION"))
+            .bind(field(&event, "DESCRIPTION"))
+            .bind(field(&event, "STATUS"))
+            .bind(rule)
+            .bind(ical)
+            .bind(field(&event, "RECURRENCE-ID"))
+            .bind(tz)
+            .bind(field(&event, "TRANSP"))
+            .execute(&mut *conn)
+            .await?;
+            Ok(())
+        }
+        .await;
+        result.map_err(|e| e.context(diagnostics::EventFailure::from_event(&event)))?;
     }
     Ok(())
 }

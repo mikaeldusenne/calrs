@@ -1,10 +1,58 @@
 //! Resolve iCalendar TZIDs that Exchange/DavMail emit (Windows names, Microsoft
-//! Olson URIs, VTIMEZONE ids) into chrono-tz zones.
+//! Olson URIs) and evaluate resource-defined VTIMEZONE observances.
 
+mod custom;
+
+use chrono::{NaiveDateTime, TimeZone};
 use chrono_tz::Tz;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::utils::{parse_ical_datetime, unfold_ical};
+
+const CUSTOM_PREFIX: &str = "calrs-vtimezone:";
+
+#[derive(Clone, Debug)]
+pub(crate) enum Zone {
+    Iana(Tz),
+    Custom(Arc<custom::CustomZone>),
+}
+
+impl Zone {
+    pub(crate) fn local_instant(
+        &self,
+        local: NaiveDateTime,
+    ) -> Result<(NaiveDateTime, bool), &'static str> {
+        match self {
+            Self::Iana(tz) => tz
+                .from_local_datetime(&local)
+                .earliest()
+                .map(|date| (date.naive_utc(), true))
+                .ok_or("unsupported_timezone"),
+            Self::Custom(tz) => tz.local_instant(local),
+        }
+    }
+
+    pub(crate) fn to_utc(&self, local: NaiveDateTime) -> Result<NaiveDateTime, &'static str> {
+        self.local_instant(local).map(|(utc, _)| utc)
+    }
+
+    pub(crate) fn to_local(&self, utc: NaiveDateTime) -> Result<NaiveDateTime, &'static str> {
+        match self {
+            Self::Iana(tz) => Ok(utc.and_utc().with_timezone(tz).naive_local()),
+            Self::Custom(tz) => tz.to_local(utc),
+        }
+    }
+
+    fn stored_name(&self) -> Result<String, &'static str> {
+        match self {
+            Self::Iana(tz) => Ok(tz.name().to_string()),
+            Self::Custom(tz) => serde_json::to_string(&**tz)
+                .map(|s| format!("{CUSTOM_PREFIX}{s}"))
+                .map_err(|_| "unsupported_timezone"),
+        }
+    }
+}
 
 /// CLDR windowsZones territory 001 (Unicode CLDR 48).
 const WINDOWS_ZONES: &[(&str, &str)] = &[
@@ -149,11 +197,11 @@ const WINDOWS_ZONES: &[(&str, &str)] = &[
     ("Yukon Standard Time", "America/Whitehorse"),
 ];
 
-/// Explicit IANA location aliases from VTIMEZONE components in one resource.
-/// A declaration alone does not make its STANDARD/DAYLIGHT rules interpretable.
+/// Timezone definitions and location aliases belonging to one calendar resource.
 #[derive(Default)]
 pub(crate) struct VTimezones {
     locations: HashMap<String, String>,
+    custom: HashMap<String, Result<Zone, &'static str>>,
 }
 
 impl VTimezones {
@@ -169,7 +217,13 @@ impl VTimezones {
             let block = &unfolded[start..start + rel_end];
             if let Some(tzid) = block_property(block, "TZID") {
                 if let Some(loc) = block_property(block, "X-LIC-LOCATION") {
-                    out.locations.insert(tzid, loc);
+                    out.locations.insert(tzid.clone(), loc);
+                }
+                if block.contains("BEGIN:STANDARD") || block.contains("BEGIN:DAYLIGHT") {
+                    out.custom.insert(
+                        tzid,
+                        custom::CustomZone::parse(block).map(|z| Zone::Custom(Arc::new(z))),
+                    );
                 }
             }
             search = start + rel_end + "END:VTIMEZONE".len();
@@ -179,14 +233,32 @@ impl VTimezones {
 
     /// Shared by snapshot validation and recurrence exclusions. Never interpret
     /// an unresolved named zone as floating time, even if a VTIMEZONE exists.
-    pub(crate) fn resolve(&self, tzid: Option<&str>) -> Result<Option<Tz>, &'static str> {
+    pub(crate) fn resolve(&self, tzid: Option<&str>) -> Result<Option<Zone>, &'static str> {
         let Some(id) = tzid else {
             return Ok(None); // A genuinely floating/all-day value has no TZID.
         };
-        resolve_tzid(id)
-            .or_else(|| self.locations.get(id).and_then(|loc| resolve_tzid(loc)))
-            .map(Some)
+        if let Some(tz) = resolve_tzid(id) {
+            return Ok(Some(Zone::Iana(tz)));
+        }
+        if let Some(zone) = self.custom.get(id) {
+            return zone.clone().map(Some);
+        }
+        self.locations
+            .get(id)
+            .and_then(|loc| resolve_tzid(loc))
+            .map(|tz| Some(Zone::Iana(tz)))
             .ok_or("unsupported_timezone")
+    }
+}
+
+/// Decode our cache format only for stored rows, never for incoming TZID values.
+pub(crate) fn resolve_stored(tzid: Option<&str>) -> Result<Option<Zone>, &'static str> {
+    if let Some(data) = tzid.and_then(|id| id.strip_prefix(CUSTOM_PREFIX)) {
+        serde_json::from_str::<custom::CustomZone>(data)
+            .map(|z| Some(Zone::Custom(Arc::new(z))))
+            .map_err(|_| "unsupported_timezone")
+    } else {
+        VTimezones::default().resolve(tzid)
     }
 }
 
@@ -255,13 +327,12 @@ fn iana_from_path(tzid: &str) -> Option<Tz> {
     }
 }
 
-/// Store only a resolved IANA name so all availability paths can apply DST.
+/// Store an IANA name or validated custom rules for every availability consumer.
 pub(crate) fn accept_tzid(
     tzid: Option<&str>,
     vtz: &VTimezones,
 ) -> Result<Option<String>, &'static str> {
-    vtz.resolve(tzid)
-        .map(|tz| tz.map(|tz| tz.name().to_string()))
+    vtz.resolve(tzid)?.map(|tz| tz.stored_name()).transpose()
 }
 
 /// Split `;PARAM=...:value` with RFC 5545 quoting. Outlook's unquoted
@@ -403,6 +474,17 @@ mod tests {
     fn unknown_without_vtimezone_is_rejected() {
         assert!(accept_tzid(Some("Not/AZone"), &VTimezones::default()).is_err());
         assert_eq!(accept_tzid(None, &VTimezones::default()).unwrap(), None);
+    }
+
+    #[test]
+    fn cache_encoding_cannot_be_injected_as_an_incoming_tzid() {
+        let definitions = VTimezones::parse("BEGIN:VTIMEZONE\nTZID:Custom\nBEGIN:STANDARD\nDTSTART:20000101T000000\nTZOFFSETFROM:+0100\nTZOFFSETTO:+0100\nEND:STANDARD\nEND:VTIMEZONE");
+        let stored = accept_tzid(Some("Custom"), &definitions).unwrap().unwrap();
+        assert!(matches!(
+            resolve_stored(Some(&stored)).unwrap(),
+            Some(Zone::Custom(_))
+        ));
+        assert!(accept_tzid(Some(&stored), &VTimezones::default()).is_err());
     }
 
     #[test]

@@ -11,6 +11,12 @@ diagnostic reference and a safe error code/HTTP status. It links to write-calend
 setup after a successful first sync. Sharing these fields is sufficient; do not
 copy calendar content or raw DavMail logs.
 
+When validation fails on an event, its owner also sees a private event summary:
+title, start/end, timezone identifiers, UID and recurrence instance, when present.
+Descriptions, attendees and email bodies are excluded. This HTML is escaped,
+owner-only and served with `Cache-Control: no-store`; it is not an operator log.
+The summary is cleared on retry or source reconfiguration.
+
 ## Fetch and publication
 
 CalDAV synchronization follows [RFC 4791 section 8.2.1](https://www.rfc-editor.org/rfc/rfc4791.html#section-8.2.1):
@@ -66,15 +72,23 @@ an empty calendar. Users with no calendar source keep their existing behavior.
 The reminder loop proactively queues stale sources; guest pages also enqueue
 without waiting for Exchange. SQL read failures block availability.
 
-Unsupported sub-daily rules, RDATE/RANGE=THISANDFUTURE and timezone identifiers
-that cannot be resolved to IANA (directly, from a Windows/CLDR name, a
-Microsoft/libical Olson URI, or VTIMEZONE `X-LIC-LOCATION`) fail explicitly; they must not
-silently become free time. DavMail/Exchange TZIDs such as `Romance Standard Time`
-are mapped to IANA (`Europe/Paris`) and stored under that name. The same resolver
-validates and converts EXDATE/RECURRENCE-ID exclusions. A VTIMEZONE declaration
-alone is not sufficient: custom STANDARD/DAYLIGHT rules without an interpretable
-location remain `unsupported_timezone`, never floating wall-clock time. An expansion
-safety limit blocks the requested period and emits `recurrence_limit` metadata.
+DavMail/Exchange TZIDs such as `Romance Standard Time` resolve through IANA,
+Windows/CLDR or recognized Microsoft/libical URI aliases. Unknown names work too
+when their VTIMEZONE provides valid STANDARD/DAYLIGHT observances: offsets,
+DTSTART, RRULE and RDATE are evaluated directly, without guessing a similar zone.
+X-LIC-LOCATION is a fallback when no observances are supplied. Only timezone rules
+are serialized alongside cached dates; original calendar resources are preserved.
+The same resolver converts EXDATE/RECURRENCE-ID exclusions and booking intervals.
+Custom recurrences retain ancient masters, apply UNTIL in UTC, choose the first
+occurrence of an ambiguous local time and skip nonexistent generated times without
+counting them toward COUNT. Historical occurrences are not stored individually.
+
+Unknown zones with missing/invalid definitions still fail as `unsupported_timezone`.
+Unsupported event-level sub-daily rules and RDATE/RANGE=THISANDFUTURE also fail
+explicitly; they must not silently become free time. Expansion safety limits block
+the requested period and emit a fixed error code. Observance expansion is capped
+at 8192 transitions; custom event expansion at one million candidates and 10000
+in-window occurrences.
 The new status UI is provided in French and English; other shipped locales
 currently contain explicitly marked English copy.
 
@@ -90,11 +104,12 @@ Merge through human review, rebuild the Calrs fork, mirror/deploy it through the
 normal PodSaN workflow, and verify the running image revision. No proxy timeout
 increase or new infrastructure is needed. Deploy the DavMail log hardening too.
 
-Back up SQLite before upgrading (migrations 064/065). Existing sources deliberately
+Back up SQLite before upgrading (migrations 064–066). Existing sources deliberately
 start unverified because older versions could record false successes: their
 booking availability is withheld until the first successful background sync.
-Migration 065 retains cached events but invalidates previous timezone verification
-once, so an unchanged ctag cannot preserve a snapshot accepted by the old parser.
+Migrations 065/066 retain cached events but invalidate previous timezone
+verification, so an unchanged ctag cannot preserve a snapshot accepted by an old
+parser. Migration 066 also adds the private event-error field.
 Test one busy account before general rollout, including an old recurring meeting,
 a moved/deleted occurrence and an Outlook conflict. To roll back, stop the new
 workers and restore the pre-upgrade DB backup together with the previous image.
@@ -103,9 +118,11 @@ If a 504 still occurs on the short Sync POST or status GET, record its timestamp
 request path and running image revision, then inspect the actual reverse proxy.
 Do not attribute it automatically to Exchange.
 
-For `unsupported_timezone`, an updated image fixes supported aliases, not arbitrary
-custom zones. If the error persists, keep availability blocked and use the attempt
-ID and error code for diagnosis; do not paste ICS/email contents into a ticket.
+For `unsupported_timezone`, an updated image handles both recognized aliases and
+valid custom observances. If the error persists, the owner can locate the exact
+event using the private report and correct its timezone in the calendar source.
+Keep availability blocked and use the attempt ID and error code for operator
+diagnosis; do not paste the private report, ICS or email contents into a public ticket.
 Do not close the incident on a documentation merge: first verify the deployed image,
 a successful complete sync, and known busy times including a moved/cancelled
 occurrence and a daylight-saving transition.
@@ -118,8 +135,10 @@ request. `response_headers` versus `response_body` pinpoints where an HTTP wait
 occurred. A final `background sync finished outcome="ok"` means a complete
 snapshot was verified, unlike an old intermediate “step finished” record.
 
-No diagnostic payload contains credentials, URLs, email/calendar contents or
-arbitrary upstream error text. The SMTP test-message/body dumps have been removed.
+No diagnostic log contains credentials, URLs, email/calendar contents or
+arbitrary upstream error text. The private owner-facing summary is stored separately
+from log messages; its error Display/Debug representations are redacted too.
+The SMTP test-message/body dumps have been removed.
 ICS content still exists in the private application cache because recurrence
 masters and exceptions are needed. DavMail must run at WARN or above: its DEBUG
 wire dumps are independent of Calrs and are not disabled by dumpICS=0 alone.

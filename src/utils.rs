@@ -127,27 +127,32 @@ pub fn extract_vevent_tzid(vevent: &str, field: &str) -> Option<String> {
 
 /// Convert a NaiveDateTime from the event's timezone to the target timezone.
 ///
-/// - If `event_tz` is `Some` and resolves (IANA, Windows, Microsoft URI) → convert
+/// - If `event_tz` resolves (IANA, Windows, URI, cached custom rules) → convert
 /// - If `None` (floating) → return as-is (backward-compatible)
-/// - If resolution fails → return as-is (graceful degradation)
+/// - Display-only fallback if resolution fails; booking uses checked_event_to_tz.
 pub fn convert_event_to_tz(
     dt: NaiveDateTime,
     event_tz: Option<&str>,
     target_tz: Tz,
 ) -> NaiveDateTime {
-    let etz: Tz = match event_tz {
-        Some(tz_str) => match crate::timezone::resolve_tzid(tz_str) {
-            Some(tz) => tz,
-            None => return dt,
-        },
-        None => return dt,
-    };
+    checked_event_to_tz(dt, event_tz, target_tz).unwrap_or(dt)
+}
 
-    // Convert: event's local time → absolute instant → target TZ local time
-    use chrono::TimeZone;
-    match etz.from_local_datetime(&dt).earliest() {
-        Some(zoned) => zoned.with_timezone(&target_tz).naive_local(),
-        None => dt, // impossible time during DST transition
+/// Availability callers must propagate a conversion failure, never drop the event.
+pub(crate) fn checked_event_to_tz(
+    dt: NaiveDateTime,
+    event_tz: Option<&str>,
+    target_tz: Tz,
+) -> Option<NaiveDateTime> {
+    match crate::timezone::resolve_stored(event_tz).ok()? {
+        Some(zone) => Some(
+            zone.to_utc(dt)
+                .ok()?
+                .and_utc()
+                .with_timezone(&target_tz)
+                .naive_local(),
+        ),
+        None => Some(dt),
     }
 }
 

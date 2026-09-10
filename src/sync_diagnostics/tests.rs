@@ -45,6 +45,30 @@ async fn diagnostics_redact_errors_and_report_dropped_futures() {
     }
 }
 
+#[tokio::test]
+async fn private_event_context_never_enters_diagnostic_logs_or_error_formatting() {
+    let detail = EventFailure::from_event("BEGIN:VEVENT\nUID:SECRET-UID\nSUMMARY:SECRET-TITLE\nDTSTART;TZID=SECRET-TZ:20260715T100000\nDESCRIPTION:SECRET-BODY\nEND:VEVENT");
+    let error = anyhow::Error::from(SyncFailure::new("unsupported_timezone")).context(detail);
+    assert_eq!(error_kind(&error), "unsupported_timezone");
+    assert!(!format!("{error:#} {error:?}").contains("SECRET"));
+    let private = serde_json::to_string(error.downcast_ref::<EventFailure>().unwrap()).unwrap();
+    assert!(private.contains("SECRET-TITLE"));
+    assert!(!private.contains("SECRET-BODY"));
+    let capture = Capture::default();
+    let writer = capture.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_writer(move || writer.clone())
+        .finish();
+    let _ = trace::<()>("commit_snapshot", async { Err(error) })
+        .with_subscriber(subscriber)
+        .await;
+    let logs = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+    assert!(logs.contains("unsupported_timezone"));
+    assert!(!logs.contains("SECRET"));
+}
+
 /// A body timeout must remain a reqwest timeout after receiving valid headers.
 #[tokio::test]
 async fn body_timeout_preserves_status_and_error() {

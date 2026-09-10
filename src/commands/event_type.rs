@@ -7,7 +7,7 @@ use sqlx::SqlitePool;
 use tabled::{Table, Tabled};
 use uuid::Uuid;
 
-use crate::utils::{convert_event_to_tz, parse_ical_datetime};
+use crate::utils::parse_ical_datetime;
 
 #[derive(Debug, Subcommand)]
 pub enum EventTypeCommands {
@@ -254,18 +254,27 @@ pub async fn run(pool: &SqlitePool, cmd: EventTypeCommands) -> Result<()> {
             // Non-recurring events (with timezone for conversion)
             let events = fetch_nonrecurring_busy_events(pool, &et_id, now, window_end_dt).await?;
 
-            let mut busy_events: Vec<(String, String)> = events
+            let busy_events: Option<Vec<(String, String)>> = events
                 .iter()
-                .filter_map(|(s, e, tz)| {
-                    let start =
-                        convert_event_to_tz(parse_ical_datetime(s)?, tz.as_deref(), host_tz);
-                    let end = convert_event_to_tz(parse_ical_datetime(e)?, tz.as_deref(), host_tz);
+                .map(|(s, e, tz)| {
+                    let start = crate::utils::checked_event_to_tz(
+                        parse_ical_datetime(s)?,
+                        tz.as_deref(),
+                        host_tz,
+                    )?;
+                    let end = crate::utils::checked_event_to_tz(
+                        parse_ical_datetime(e)?,
+                        tz.as_deref(),
+                        host_tz,
+                    )?;
                     Some((
                         start.format("%Y-%m-%dT%H:%M:%S").to_string(),
                         end.format("%Y-%m-%dT%H:%M:%S").to_string(),
                     ))
                 })
                 .collect();
+            let mut busy_events = busy_events
+                .ok_or_else(|| anyhow::anyhow!("Calendar event time could not be interpreted"))?;
 
             // Bookings (already in host-local time, no conversion needed)
             let booking_busy: Vec<(String, String)> = sqlx::query_as(

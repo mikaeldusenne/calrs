@@ -53,10 +53,10 @@ pub(crate) fn validate(start: NaiveDateTime, rule: &str, tz: Option<&str>) -> an
     rule_set(
         start,
         rule,
-        crate::timezone::VTimezones::default()
-            .resolve(tz)
-            .map_err(SyncFailure::new)?
-            .unwrap_or(chrono_tz::UTC),
+        match crate::timezone::resolve_stored(tz).map_err(SyncFailure::new)? {
+            Some(crate::timezone::Zone::Iana(tz)) => tz,
+            _ => chrono_tz::UTC, // Custom rules expand in civil time, then resolve each instant.
+        },
     )
     .map(|_| ())
 }
@@ -134,12 +134,29 @@ fn extract_exdates(raw_ical: &str) -> anyhow::Result<Vec<NaiveDateTime>> {
     extract_exdates_in_tz(raw_ical, None)
 }
 
-pub(crate) fn extract_exdates_in_tz(
+#[cfg(test)]
+fn extract_exdates_in_tz(
     raw_ical: &str,
     event_zone: Option<chrono_tz::Tz>,
 ) -> anyhow::Result<Vec<NaiveDateTime>> {
+    let zone = event_zone.map(crate::timezone::Zone::Iana);
+    extract_exdates_for_zone(raw_ical, zone.as_ref())
+}
+
+pub(crate) fn extract_exdates_for_zone(
+    raw_ical: &str,
+    event_zone: Option<&crate::timezone::Zone>,
+) -> anyhow::Result<Vec<NaiveDateTime>> {
     let raw = crate::utils::unfold_ical(raw_ical);
     let vtz = crate::timezone::VTimezones::parse(&raw);
+    extract_exdates_using(&raw, event_zone, &vtz)
+}
+
+pub(crate) fn extract_exdates_using(
+    raw: &str,
+    event_zone: Option<&crate::timezone::Zone>,
+    vtz: &crate::timezone::VTimezones,
+) -> anyhow::Result<Vec<NaiveDateTime>> {
     let mut dates = Vec::new();
     for line in raw.lines() {
         let property = if line.starts_with("EXDATE") {
@@ -164,21 +181,123 @@ pub(crate) fn extract_exdates_in_tz(
             let value = value.trim();
             let date = crate::utils::parse_ical_datetime(value)
                 .ok_or_else(|| SyncFailure::new("invalid_recurrence"))?;
-            let zone = source_zone.or_else(|| value.ends_with('Z').then_some(chrono_tz::UTC));
+            let utc = crate::timezone::Zone::Iana(chrono_tz::UTC);
+            let zone = source_zone
+                .as_ref()
+                .or_else(|| value.ends_with('Z').then_some(&utc));
             let zoned = zone
                 .map(|zone| {
-                    zone.from_local_datetime(&date)
-                        .earliest()
-                        .ok_or_else(|| SyncFailure::new("invalid_recurrence"))
+                    zone.to_utc(date).map_err(|code| {
+                        SyncFailure::new(match zone {
+                            crate::timezone::Zone::Iana(_) => "invalid_recurrence",
+                            crate::timezone::Zone::Custom(_) => code,
+                        })
+                    })
                 })
                 .transpose()?;
             dates.push(match (zoned, event_zone) {
-                (Some(date), Some(zone)) => date.with_timezone(&zone).naive_local(),
+                (Some(date), Some(zone)) => zone.to_local(date).map_err(SyncFailure::new)?,
                 _ => date,
             });
         }
     }
     Ok(dates)
+}
+
+/// UTC busy intervals for a civil recurrence with a resource-defined timezone.
+/// COUNT counts real occurrences before EXDATE; skipped DST times do not count.
+pub(crate) fn expand_custom(
+    start: NaiveDateTime,
+    end: NaiveDateTime,
+    rule: &str,
+    exdates: &[NaiveDateTime],
+    window: (NaiveDateTime, NaiveDateTime),
+    zone: &crate::timezone::Zone,
+) -> anyhow::Result<Vec<(NaiveDateTime, NaiveDateTime)>> {
+    rule_set(start, rule, chrono_tz::UTC)?; // Validate the complete rule first.
+    let count = rule
+        .split(';')
+        .find_map(|p| p.strip_prefix("COUNT="))
+        .and_then(|s| s.parse::<usize>().ok());
+    let until = rule.split(';').find_map(|p| p.strip_prefix("UNTIL="));
+    let until = until
+        .map(|s| {
+            let dt = if s.len() == 8 {
+                format!("{s}T235959")
+            } else {
+                s.to_string()
+            };
+            let date = crate::utils::parse_ical_datetime(&dt)
+                .ok_or_else(|| SyncFailure::new("invalid_recurrence"))?;
+            Ok::<_, anyhow::Error>(if s.ends_with('Z') {
+                date
+            } else {
+                zone.to_utc(date).map_err(SyncFailure::new)?
+            })
+        })
+        .transpose()?;
+    let civil = rule
+        .split(';')
+        .filter(|p| !p.starts_with("COUNT=") && !p.starts_with("UNTIL="))
+        .collect::<Vec<_>>()
+        .join(";");
+    let set = rule_set(start, &civil, chrono_tz::UTC)?;
+    let stop = window
+        .1
+        .checked_add_signed(chrono::Duration::days(2))
+        .ok_or_else(|| SyncFailure::new("invalid_recurrence"))?;
+    let duration = end - start;
+    let relevant_after = window
+        .0
+        .checked_sub_signed(duration)
+        .and_then(|d| d.checked_sub_signed(chrono::Duration::days(2)))
+        .ok_or_else(|| SyncFailure::new("invalid_recurrence"))?;
+    let mut seen = 0;
+    let mut busy = Vec::new();
+    for (index, date) in set.into_iter().enumerate() {
+        let local = date.naive_utc();
+        if local >= stop {
+            break;
+        }
+        if index >= 1_000_000 {
+            return Err(SyncFailure::new("unsupported_recurrence").into());
+        }
+        // A non-counted ancient series needs no historical offset calculations.
+        if count.is_none() && local < relevant_after {
+            continue;
+        }
+        let (utc, exists) = zone.local_instant(local).map_err(SyncFailure::new)?;
+        if !exists {
+            continue;
+        }
+        if let Some(until) = until.filter(|until| utc > *until) {
+            if local - until > chrono::Duration::days(2) {
+                break;
+            }
+            continue;
+        }
+        seen += 1;
+        if count.is_some_and(|count| seen > count) {
+            break;
+        }
+        if exdates.contains(&local) {
+            continue;
+        }
+        let end = zone
+            .to_utc(
+                local
+                    .checked_add_signed(duration)
+                    .ok_or_else(|| SyncFailure::new("invalid_recurrence"))?,
+            )
+            .map_err(SyncFailure::new)?;
+        if utc < window.1 && end > window.0 {
+            if busy.len() >= 10_000 {
+                return Err(SyncFailure::new("unsupported_recurrence").into());
+            }
+            busy.push((utc, end));
+        }
+    }
+    Ok(busy)
 }
 
 #[cfg(test)]
