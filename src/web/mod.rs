@@ -12565,14 +12565,26 @@ pub(crate) fn expand_recurring_into_busy(
     let mut result = Vec::new();
     for (s, e, rrule_str, raw_ical, event_tz) in recurring {
         if let (Some(ev_start), Some(ev_end)) = (parse_ical_datetime(s), parse_ical_datetime(e)) {
-            let event_zone = event_tz
-                .as_deref()
-                .and_then(|s| s.parse::<Tz>().ok())
-                .unwrap_or(host_tz);
+            let event_zone = match crate::timezone::VTimezones::default()
+                .resolve(event_tz.as_deref())
+            {
+                Ok(zone) => zone.unwrap_or(host_tz),
+                Err(code) => {
+                    tracing::warn!(target: crate::sync_diagnostics::TARGET, error_kind = code, "availability blocked");
+                    return vec![(window_start, window_end)];
+                }
+            };
             let exdates = raw_ical
                 .as_deref()
                 .map(|ical| crate::rrule::extract_exdates_in_tz(ical, Some(event_zone)))
-                .unwrap_or_default();
+                .transpose();
+            let exdates = match exdates {
+                Ok(dates) => dates.unwrap_or_default(),
+                Err(error) => {
+                    tracing::warn!(target: crate::sync_diagnostics::TARGET, error_kind = crate::sync_diagnostics::error_kind(&error), "availability blocked");
+                    return vec![(window_start, window_end)];
+                }
+            };
             // Expand RRULE in the event's own timezone (correct for DST)
             let occurrences = crate::rrule::expand_rrule_in_tz(
                 ev_start,
@@ -15296,29 +15308,22 @@ async fn troubleshoot(
         .and_hms_opt(23, 59, 59)
         .unwrap_or(target_date.and_time(NaiveTime::MIN));
     for (s, e, rrule_str, raw_ical, summary, cal_name, event_tz) in &recurring_events {
-        if let (Some(ev_start), Some(ev_end)) = (parse_ical_datetime(s), parse_ical_datetime(e)) {
-            let exdates = raw_ical
-                .as_deref()
-                .map(crate::rrule::extract_exdates)
-                .unwrap_or_default();
-            let occurrences = crate::rrule::expand_rrule(
-                ev_start,
-                ev_end,
-                rrule_str,
-                &exdates,
-                ts_window_start,
-                ts_window_end,
-            );
-            for (os, oe) in occurrences {
-                let cs = convert_event_to_tz(os, event_tz.as_deref(), host_tz);
-                let ce = convert_event_to_tz(oe, event_tz.as_deref(), host_tz);
-                busy_events.push((
-                    cs.format("%Y-%m-%dT%H:%M:%S").to_string(),
-                    ce.format("%Y-%m-%dT%H:%M:%S").to_string(),
-                    summary.clone(),
-                    cal_name.clone(),
-                ));
-            }
+        let recurring = [(
+            s.clone(),
+            e.clone(),
+            rrule_str.clone(),
+            raw_ical.clone(),
+            event_tz.clone(),
+        )];
+        for (start, end) in
+            expand_recurring_into_busy(&recurring, ts_window_start, ts_window_end, host_tz)
+        {
+            busy_events.push((
+                start.format("%Y-%m-%dT%H:%M:%S").to_string(),
+                end.format("%Y-%m-%dT%H:%M:%S").to_string(),
+                summary.clone(),
+                cal_name.clone(),
+            ));
         }
     }
 
@@ -22490,6 +22495,21 @@ mod tests {
     }
 
     // --- Integration tests with in-memory SQLite ---
+
+    #[test]
+    fn unresolved_or_invalid_recurrence_timezone_blocks_the_entire_window() {
+        let start = dt(2026, 7, 15, 0, 0);
+        let end = dt(2026, 7, 16, 0, 0);
+        for (zone, raw) in [
+            ("Opaque", "BEGIN:VEVENT\nEND:VEVENT"),
+            ("UTC", "BEGIN:VCALENDAR\nBEGIN:VTIMEZONE\nTZID:Opaque\nEND:VTIMEZONE\nBEGIN:VEVENT\nEXDATE;TZID=Opaque:20260715T100000\nEND:VEVENT\nEND:VCALENDAR"),
+            ("UTC", "BEGIN:VEVENT\nRECURRENCE-ID:invalid\nEND:VEVENT"),
+        ] {
+            let recurring = [("20260715T080000Z".into(), "20260715T090000Z".into(),
+                "FREQ=DAILY".into(), Some(raw.into()), Some(zone.into()))];
+            assert_eq!(expand_recurring_into_busy(&recurring, start, end, Tz::UTC), vec![(start, end)]);
+        }
+    }
 
     async fn setup_test_db() -> SqlitePool {
         use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};

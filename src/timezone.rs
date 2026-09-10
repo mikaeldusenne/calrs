@@ -2,7 +2,7 @@
 //! Olson URIs, VTIMEZONE ids) into chrono-tz zones.
 
 use chrono_tz::Tz;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::utils::{parse_ical_datetime, unfold_ical};
 
@@ -149,10 +149,10 @@ const WINDOWS_ZONES: &[(&str, &str)] = &[
     ("Yukon Standard Time", "America/Whitehorse"),
 ];
 
-/// TZIDs defined by VTIMEZONE components in one iCalendar resource.
+/// Explicit IANA location aliases from VTIMEZONE components in one resource.
+/// A declaration alone does not make its STANDARD/DAYLIGHT rules interpretable.
 #[derive(Default)]
 pub(crate) struct VTimezones {
-    ids: HashSet<String>,
     locations: HashMap<String, String>,
 }
 
@@ -169,29 +169,32 @@ impl VTimezones {
             let block = &unfolded[start..start + rel_end];
             if let Some(tzid) = block_property(block, "TZID") {
                 if let Some(loc) = block_property(block, "X-LIC-LOCATION") {
-                    out.locations.insert(tzid.clone(), loc);
+                    out.locations.insert(tzid, loc);
                 }
-                out.ids.insert(tzid);
             }
             search = start + rel_end + "END:VTIMEZONE".len();
         }
         out
     }
 
-    pub(crate) fn contains(&self, tzid: &str) -> bool {
-        self.ids.contains(tzid)
-    }
-
-    pub(crate) fn location(&self, tzid: &str) -> Option<&str> {
-        self.locations.get(tzid).map(String::as_str)
+    /// Shared by snapshot validation and recurrence exclusions. Never interpret
+    /// an unresolved named zone as floating time, even if a VTIMEZONE exists.
+    pub(crate) fn resolve(&self, tzid: Option<&str>) -> Result<Option<Tz>, &'static str> {
+        let Some(id) = tzid else {
+            return Ok(None); // A genuinely floating/all-day value has no TZID.
+        };
+        resolve_tzid(id)
+            .or_else(|| self.locations.get(id).and_then(|loc| resolve_tzid(loc)))
+            .map(Some)
+            .ok_or("unsupported_timezone")
     }
 }
 
 fn block_property(block: &str, name: &str) -> Option<String> {
     for line in block.lines() {
         if let Some(rest) = line.strip_prefix(name) {
-            if rest.starts_with(':') {
-                let value = rest[1..].trim();
+            if let Some(value) = rest.strip_prefix(':') {
+                let value = value.trim();
                 if !value.is_empty() {
                     return Some(value.to_string());
                 }
@@ -209,8 +212,8 @@ fn block_property(block: &str, name: &str) -> Option<String> {
 
 /// Map a TZID from DTSTART/DTEND/EXDATE to a chrono-tz zone.
 ///
-/// Order: IANA (including UTC/GMT aliases), Windows CLDR names, then the last
-/// Area/City path segment of Microsoft/libical URIs.
+/// Order: IANA (including UTC/GMT aliases), Windows CLDR names, then the IANA
+/// suffix of a recognized Microsoft/libical URI (including three-part names).
 pub fn resolve_tzid(tzid: &str) -> Option<Tz> {
     let tzid = tzid.trim().trim_matches('"').trim();
     if tzid.is_empty() {
@@ -236,50 +239,29 @@ pub fn resolve_tzid(tzid: &str) -> Option<Tz> {
 }
 
 fn iana_from_path(tzid: &str) -> Option<Tz> {
-    let trimmed = tzid.trim_start_matches('/');
-    let parts: Vec<&str> = trimmed
-        .split('/')
-        .filter(|p| !p.is_empty() && *p != "tzone:" && *p != "tzone")
-        .collect();
-    if parts.len() >= 2 {
-        let candidate = format!("{}/{}", parts[parts.len() - 2], parts[parts.len() - 1]);
-        if let Ok(tz) = candidate.parse::<Tz>() {
+    let mut suffix = tzid
+        .strip_prefix("tzone://Microsoft/Olson/")
+        .or_else(|| tzid.strip_prefix("/freeassociation.sourceforge.net/"))?;
+    loop {
+        if let Ok(tz) = suffix.parse::<Tz>() {
             return Some(tz);
         }
-    }
-    let last = parts.last()?;
-    if let Ok(tz) = last.parse::<Tz>() {
-        return Some(tz);
-    }
-    for (windows, iana) in WINDOWS_ZONES {
-        if windows.eq_ignore_ascii_case(last) {
-            return iana.parse().ok();
+        for (windows, iana) in WINDOWS_ZONES {
+            if windows.eq_ignore_ascii_case(suffix) {
+                return iana.parse().ok();
+            }
         }
+        suffix = suffix.split_once('/')?.1;
     }
-    None
 }
 
-/// Accept a TZID if it maps to IANA or is defined by a VTIMEZONE in this resource.
-/// Returns the IANA name when known so later availability conversions keep DST.
+/// Store only a resolved IANA name so all availability paths can apply DST.
 pub(crate) fn accept_tzid(
     tzid: Option<&str>,
     vtz: &VTimezones,
 ) -> Result<Option<String>, &'static str> {
-    let Some(id) = tzid.map(str::trim).filter(|s| !s.is_empty()) else {
-        return Ok(None);
-    };
-    if let Some(tz) = resolve_tzid(id) {
-        return Ok(Some(tz.name().to_string()));
-    }
-    if let Some(loc) = vtz.location(id) {
-        if let Some(tz) = resolve_tzid(loc) {
-            return Ok(Some(tz.name().to_string()));
-        }
-    }
-    if vtz.contains(id) {
-        return Ok(Some(id.to_string()));
-    }
-    Err("unsupported_timezone")
+    vtz.resolve(tzid)
+        .map(|tz| tz.map(|tz| tz.name().to_string()))
 }
 
 /// Split `;PARAM=...:value` with RFC 5545 quoting. Outlook's unquoted
@@ -295,9 +277,14 @@ pub(crate) fn params_and_value(rest: &str) -> Option<(Vec<(String, String)>, Str
     let first = unquoted_colon(rest)?;
     let mut params_str = &rest[1..first];
     let mut value = rest[first + 1..].to_string();
-    if parse_ical_datetime(value.trim()).is_none() {
+    let is_date_list = |value: &str| {
+        value
+            .split(',')
+            .all(|v| parse_ical_datetime(v.trim()).is_some())
+    };
+    if !is_date_list(&value) {
         if let Some(last) = rest.rfind(':') {
-            if last > first && parse_ical_datetime(rest[last + 1..].trim()).is_some() {
+            if last > first && is_date_list(&rest[last + 1..]) {
                 params_str = &rest[1..last];
                 value = rest[last + 1..].to_string();
             }
@@ -384,6 +371,13 @@ mod tests {
             "Europe/Paris"
         );
         assert_eq!(
+            resolve_tzid("tzone://Microsoft/Olson/America/Argentina/Buenos_Aires")
+                .unwrap()
+                .name(),
+            "America/Argentina/Buenos_Aires"
+        );
+        assert!(resolve_tzid("Opaque/Europe/Paris").is_none());
+        assert_eq!(
             resolve_tzid("/freeassociation.sourceforge.net/Europe/Paris")
                 .unwrap()
                 .name(),
@@ -395,18 +389,13 @@ mod tests {
     fn vtimezone_location_and_opaque_id() {
         let ical = "BEGIN:VCALENDAR\nBEGIN:VTIMEZONE\nTZID:Customized Time Zone\nX-LIC-LOCATION:Europe/Paris\nEND:VTIMEZONE\nBEGIN:VTIMEZONE\nTZID:Local-Only\nEND:VTIMEZONE\nEND:VCALENDAR\n";
         let vtz = VTimezones::parse(ical);
-        assert_eq!(vtz.location("Customized Time Zone"), Some("Europe/Paris"));
-        assert!(vtz.contains("Local-Only"));
         assert_eq!(
             accept_tzid(Some("Customized Time Zone"), &vtz)
                 .unwrap()
                 .as_deref(),
             Some("Europe/Paris")
         );
-        assert_eq!(
-            accept_tzid(Some("Local-Only"), &vtz).unwrap().as_deref(),
-            Some("Local-Only")
-        );
+        assert!(accept_tzid(Some("Local-Only"), &vtz).is_err());
         assert!(accept_tzid(Some("Not/AZone"), &vtz).is_err());
     }
 

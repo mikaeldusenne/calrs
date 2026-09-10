@@ -67,10 +67,13 @@ The reminder loop proactively queues stale sources; guest pages also enqueue
 without waiting for Exchange. SQL read failures block availability.
 
 Unsupported sub-daily rules, RDATE/RANGE=THISANDFUTURE and timezone identifiers
-that are neither IANA, a Windows/CLDR name, a Microsoft/libical Olson URI, nor
-defined by a VTIMEZONE in the same resource fail explicitly; they must not
+that cannot be resolved to IANA (directly, from a Windows/CLDR name, a
+Microsoft/libical Olson URI, or VTIMEZONE `X-LIC-LOCATION`) fail explicitly; they must not
 silently become free time. DavMail/Exchange TZIDs such as `Romance Standard Time`
-are mapped to IANA (`Europe/Paris`) and stored under that name. An expansion
+are mapped to IANA (`Europe/Paris`) and stored under that name. The same resolver
+validates and converts EXDATE/RECURRENCE-ID exclusions. A VTIMEZONE declaration
+alone is not sufficient: custom STANDARD/DAYLIGHT rules without an interpretable
+location remain `unsupported_timezone`, never floating wall-clock time. An expansion
 safety limit blocks the requested period and emits `recurrence_limit` metadata.
 The new status UI is provided in French and English; other shipped locales
 currently contain explicitly marked English copy.
@@ -87,9 +90,11 @@ Merge through human review, rebuild the Calrs fork, mirror/deploy it through the
 normal PodSaN workflow, and verify the running image revision. No proxy timeout
 increase or new infrastructure is needed. Deploy the DavMail log hardening too.
 
-Back up SQLite before upgrading (migration 064). Existing sources deliberately
+Back up SQLite before upgrading (migrations 064/065). Existing sources deliberately
 start unverified because older versions could record false successes: their
 booking availability is withheld until the first successful background sync.
+Migration 065 retains cached events but invalidates previous timezone verification
+once, so an unchanged ctag cannot preserve a snapshot accepted by the old parser.
 Test one busy account before general rollout, including an old recurring meeting,
 a moved/deleted occurrence and an Outlook conflict. To roll back, stop the new
 workers and restore the pre-upgrade DB backup together with the previous image.
@@ -97,6 +102,13 @@ workers and restore the pre-upgrade DB backup together with the previous image.
 If a 504 still occurs on the short Sync POST or status GET, record its timestamp,
 request path and running image revision, then inspect the actual reverse proxy.
 Do not attribute it automatically to Exchange.
+
+For `unsupported_timezone`, an updated image fixes supported aliases, not arbitrary
+custom zones. If the error persists, keep availability blocked and use the attempt
+ID and error code for diagnosis; do not paste ICS/email contents into a ticket.
+Do not close the incident on a documentation merge: first verify the deployed image,
+a successful complete sync, and known busy times including a moved/cancelled
+occurrence and a daylight-saving transition.
 
 For operator-only metadata, run `./scripts/diagnose-sync.sh` in `calrs-podsan`.
 It remains compatible with older instrumentation and prints only selected stages,

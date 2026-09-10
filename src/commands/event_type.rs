@@ -300,31 +300,13 @@ pub async fn run(pool: &SqlitePool, cmd: EventTypeCommands) -> Result<()> {
             .await
             .unwrap_or_default();
 
-            for (s, e, rrule_str, raw_ical, event_tz) in &recurring {
-                if let (Some(ev_start), Some(ev_end)) =
-                    (parse_ical_datetime(s), parse_ical_datetime(e))
-                {
-                    let exdates = raw_ical
-                        .as_deref()
-                        .map(crate::rrule::extract_exdates)
-                        .unwrap_or_default();
-                    let occurrences = crate::rrule::expand_rrule(
-                        ev_start,
-                        ev_end,
-                        rrule_str,
-                        &exdates,
-                        now,
-                        window_end_dt,
-                    );
-                    for (os, oe) in occurrences {
-                        let cs = convert_event_to_tz(os, event_tz.as_deref(), host_tz);
-                        let ce = convert_event_to_tz(oe, event_tz.as_deref(), host_tz);
-                        busy_events.push((
-                            cs.format("%Y-%m-%dT%H:%M:%S").to_string(),
-                            ce.format("%Y-%m-%dT%H:%M:%S").to_string(),
-                        ));
-                    }
-                }
+            for (start, end) in
+                crate::web::expand_recurring_into_busy(&recurring, now, window_end_dt, host_tz)
+            {
+                busy_events.push((
+                    start.format("%Y-%m-%dT%H:%M:%S").to_string(),
+                    end.format("%Y-%m-%dT%H:%M:%S").to_string(),
+                ));
             }
 
             // Required shared resources: same blocking intervals as the web

@@ -249,6 +249,8 @@ async fn store_events(conn: &mut SqliteConnection, calendar_id: &str, ical: &str
     }
     let resource_uid = field(&blocks[0], "UID");
     let vtz = crate::timezone::VTimezones::parse(ical);
+    // Use the same parser/resolver as availability; validate all overrides too.
+    crate::rrule::extract_exdates_in_tz(ical, None)?;
     for event in blocks {
         let required = |name| {
             field(&event, name)
@@ -283,10 +285,10 @@ async fn store_events(conn: &mut SqliteConnection, calendar_id: &str, ical: &str
         };
         let tz =
             crate::timezone::accept_tzid(extract_vevent_tzid(&event, "DTSTART").as_deref(), &vtz)
-                .map_err(|code| SyncFailure::new(code))?;
+                .map_err(SyncFailure::new)?;
         let end_tz =
             crate::timezone::accept_tzid(extract_vevent_tzid(&event, "DTEND").as_deref(), &vtz)
-                .map_err(|code| SyncFailure::new(code))?;
+                .map_err(SyncFailure::new)?;
         let mut end_dt =
             parse_ical_datetime(&end).ok_or_else(|| SyncFailure::new("invalid_calendar"))?;
         if let (Some(start_tz), Some(end_tz)) = (&tz, &end_tz) {
@@ -303,34 +305,6 @@ async fn store_events(conn: &mut SqliteConnection, calendar_id: &str, ical: &str
         // RANGE changes later instances, not just this one: don't misinterpret it.
         if event.contains("RANGE=THISANDFUTURE") || field(&event, "RDATE").is_some() {
             return Err(SyncFailure::new("unsupported_recurrence").into());
-        }
-        // An unrecognised exclusion TZ must not accidentally suppress a real
-        // occurrence at the same wall-clock time in a different timezone.
-        for line in event.lines() {
-            let property = if line.starts_with("EXDATE") {
-                "EXDATE"
-            } else if line.starts_with("RECURRENCE-ID") {
-                "RECURRENCE-ID"
-            } else {
-                continue;
-            };
-            let rest = &line[property.len()..];
-            if rest.is_empty() || !matches!(rest.as_bytes()[0], b';' | b':') {
-                continue;
-            }
-            let Some((params, values)) = crate::timezone::params_and_value(rest) else {
-                return Err(SyncFailure::new("invalid_recurrence").into());
-            };
-            let ex_tz = params
-                .iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case("TZID"))
-                .map(|(_, v)| v.as_str());
-            crate::timezone::accept_tzid(ex_tz, &vtz).map_err(|code| SyncFailure::new(code))?;
-            for value in values.split(',') {
-                if parse_ical_datetime(value).is_none() {
-                    return Err(SyncFailure::new("invalid_recurrence").into());
-                }
-            }
         }
         let rule = field(&event, "RRULE");
         if let Some(rule) = &rule {

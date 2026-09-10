@@ -104,9 +104,7 @@ pub fn extract_vevent_tzid(vevent: &str, field: &str) -> Option<String> {
             continue;
         }
 
-        let Some((params, value)) = crate::timezone::params_and_value(rest) else {
-            return None;
-        };
+        let (params, value) = crate::timezone::params_and_value(rest)?;
         // VALUE=DATE-TIME must not be treated as all-day (it contains "VALUE=DATE").
         if params
             .iter()
