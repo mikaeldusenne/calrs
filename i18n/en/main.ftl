@@ -1360,3 +1360,13 @@ sync-error-snapshot-too-large = The calendar exceeds the 64 MiB safety limit.
 sync-error-body = The server response could not be received completely.
 sync-error-http-transport = An HTTP transport error interrupted the synchronization.
 sync-error-application = Synchronization failed. Use the reference and last stage to investigate.
+# Private synchronization failure report
+sync-event-heading = Event that could not be synchronized
+sync-event-private = Private calendar report. These details are not written to logs.
+sync-event-title = Title
+sync-event-untitled = Untitled event
+sync-event-start = Start (as received)
+sync-event-end = End (as received)
+sync-event-timezone = Timezone identifiers
+sync-event-occurrence = Original recurrence occurrence
+sync-event-uid = Event identifier

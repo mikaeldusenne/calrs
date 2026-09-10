@@ -53,7 +53,10 @@ pub(crate) fn validate(start: NaiveDateTime, rule: &str, tz: Option<&str>) -> an
     rule_set(
         start,
         rule,
-        tz.and_then(|s| s.parse().ok()).unwrap_or(chrono_tz::UTC),
+        match crate::timezone::resolve_stored(tz).map_err(SyncFailure::new)? {
+            Some(crate::timezone::Zone::Iana(tz)) => tz,
+            _ => chrono_tz::UTC, // Custom rules expand in civil time, then resolve each instant.
+        },
     )
     .map(|_| ())
 }
@@ -126,38 +129,175 @@ pub(crate) fn expand_rrule_in_tz(
 /// Returns NaiveDateTimes that should be excluded from RRULE expansion.
 /// Scans ALL VEVENTs in the resource: EXDATEs from the first (recurring) VEVENT,
 /// and RECURRENCE-ID values from any override VEVENTs (modified instances).
-pub fn extract_exdates(raw_ical: &str) -> Vec<NaiveDateTime> {
+#[cfg(test)]
+fn extract_exdates(raw_ical: &str) -> anyhow::Result<Vec<NaiveDateTime>> {
     extract_exdates_in_tz(raw_ical, None)
 }
 
-pub(crate) fn extract_exdates_in_tz(
+#[cfg(test)]
+fn extract_exdates_in_tz(
     raw_ical: &str,
     event_zone: Option<chrono_tz::Tz>,
-) -> Vec<NaiveDateTime> {
+) -> anyhow::Result<Vec<NaiveDateTime>> {
+    let zone = event_zone.map(crate::timezone::Zone::Iana);
+    extract_exdates_for_zone(raw_ical, zone.as_ref())
+}
+
+pub(crate) fn extract_exdates_for_zone(
+    raw_ical: &str,
+    event_zone: Option<&crate::timezone::Zone>,
+) -> anyhow::Result<Vec<NaiveDateTime>> {
     let raw = crate::utils::unfold_ical(raw_ical);
+    let vtz = crate::timezone::VTimezones::parse(&raw);
+    extract_exdates_using(&raw, event_zone, &vtz)
+}
+
+pub(crate) fn extract_exdates_using(
+    raw: &str,
+    event_zone: Option<&crate::timezone::Zone>,
+    vtz: &crate::timezone::VTimezones,
+) -> anyhow::Result<Vec<NaiveDateTime>> {
     let mut dates = Vec::new();
     for line in raw.lines() {
-        let Some((header, values)) = line.split_once(':') else {
+        let property = if line.starts_with("EXDATE") {
+            "EXDATE"
+        } else if line.starts_with("RECURRENCE-ID") {
+            "RECURRENCE-ID"
+        } else {
             continue;
         };
-        let property = header.split(';').next().unwrap_or("");
-        if !matches!(property, "EXDATE" | "RECURRENCE-ID") {
+        let rest = &line[property.len()..];
+        if rest.is_empty() || !matches!(rest.as_bytes()[0], b';' | b':') {
             continue;
         }
+        let (params, values) = crate::timezone::params_and_value(rest)
+            .ok_or_else(|| SyncFailure::new("invalid_recurrence"))?;
+        let tzid = params
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("TZID"))
+            .map(|(_, v)| v.as_str());
+        let source_zone = vtz.resolve(tzid).map_err(SyncFailure::new)?;
         for value in values.split(',') {
-            if let Some(date) = crate::utils::parse_ical_datetime(value.trim()) {
-                let as_start = format!("DTSTART{}:{}", &header[property.len()..], value.trim());
-                let source_zone = crate::utils::extract_vevent_tzid(&as_start, "DTSTART");
-                dates.push(match event_zone {
-                    Some(zone) => {
-                        crate::utils::convert_event_to_tz(date, source_zone.as_deref(), zone)
-                    }
-                    None => date,
-                });
-            }
+            let value = value.trim();
+            let date = crate::utils::parse_ical_datetime(value)
+                .ok_or_else(|| SyncFailure::new("invalid_recurrence"))?;
+            let utc = crate::timezone::Zone::Iana(chrono_tz::UTC);
+            let zone = source_zone
+                .as_ref()
+                .or_else(|| value.ends_with('Z').then_some(&utc));
+            let zoned = zone
+                .map(|zone| {
+                    zone.to_utc(date).map_err(|code| {
+                        SyncFailure::new(match zone {
+                            crate::timezone::Zone::Iana(_) => "invalid_recurrence",
+                            crate::timezone::Zone::Custom(_) => code,
+                        })
+                    })
+                })
+                .transpose()?;
+            dates.push(match (zoned, event_zone) {
+                (Some(date), Some(zone)) => zone.to_local(date).map_err(SyncFailure::new)?,
+                _ => date,
+            });
         }
     }
-    dates
+    Ok(dates)
+}
+
+/// UTC busy intervals for a civil recurrence with a resource-defined timezone.
+/// COUNT counts real occurrences before EXDATE; skipped DST times do not count.
+pub(crate) fn expand_custom(
+    start: NaiveDateTime,
+    end: NaiveDateTime,
+    rule: &str,
+    exdates: &[NaiveDateTime],
+    window: (NaiveDateTime, NaiveDateTime),
+    zone: &crate::timezone::Zone,
+) -> anyhow::Result<Vec<(NaiveDateTime, NaiveDateTime)>> {
+    rule_set(start, rule, chrono_tz::UTC)?; // Validate the complete rule first.
+    let count = rule
+        .split(';')
+        .find_map(|p| p.strip_prefix("COUNT="))
+        .and_then(|s| s.parse::<usize>().ok());
+    let until = rule.split(';').find_map(|p| p.strip_prefix("UNTIL="));
+    let until = until
+        .map(|s| {
+            let dt = if s.len() == 8 {
+                format!("{s}T235959")
+            } else {
+                s.to_string()
+            };
+            let date = crate::utils::parse_ical_datetime(&dt)
+                .ok_or_else(|| SyncFailure::new("invalid_recurrence"))?;
+            Ok::<_, anyhow::Error>(if s.ends_with('Z') {
+                date
+            } else {
+                zone.to_utc(date).map_err(SyncFailure::new)?
+            })
+        })
+        .transpose()?;
+    let civil = rule
+        .split(';')
+        .filter(|p| !p.starts_with("COUNT=") && !p.starts_with("UNTIL="))
+        .collect::<Vec<_>>()
+        .join(";");
+    let set = rule_set(start, &civil, chrono_tz::UTC)?;
+    let stop = window
+        .1
+        .checked_add_signed(chrono::Duration::days(2))
+        .ok_or_else(|| SyncFailure::new("invalid_recurrence"))?;
+    let duration = end - start;
+    let relevant_after = window
+        .0
+        .checked_sub_signed(duration)
+        .and_then(|d| d.checked_sub_signed(chrono::Duration::days(2)))
+        .ok_or_else(|| SyncFailure::new("invalid_recurrence"))?;
+    let mut seen = 0;
+    let mut busy = Vec::new();
+    for (index, date) in set.into_iter().enumerate() {
+        let local = date.naive_utc();
+        if local >= stop {
+            break;
+        }
+        if index >= 1_000_000 {
+            return Err(SyncFailure::new("unsupported_recurrence").into());
+        }
+        // A non-counted ancient series needs no historical offset calculations.
+        if count.is_none() && local < relevant_after {
+            continue;
+        }
+        let (utc, exists) = zone.local_instant(local).map_err(SyncFailure::new)?;
+        if !exists {
+            continue;
+        }
+        if let Some(until) = until.filter(|until| utc > *until) {
+            if local - until > chrono::Duration::days(2) {
+                break;
+            }
+            continue;
+        }
+        seen += 1;
+        if count.is_some_and(|count| seen > count) {
+            break;
+        }
+        if exdates.contains(&local) {
+            continue;
+        }
+        let end = zone
+            .to_utc(
+                local
+                    .checked_add_signed(duration)
+                    .ok_or_else(|| SyncFailure::new("invalid_recurrence"))?,
+            )
+            .map_err(SyncFailure::new)?;
+        if utc < window.1 && end > window.0 {
+            if busy.len() >= 10_000 {
+                return Err(SyncFailure::new("unsupported_recurrence").into());
+            }
+            busy.push((utc, end));
+        }
+    }
+    Ok(busy)
 }
 
 #[cfg(test)]
@@ -328,7 +468,7 @@ mod tests {
     #[test]
     fn test_extract_exdates() {
         let ical = "BEGIN:VEVENT\nDTSTART:20260302T100000\nRRULE:FREQ=WEEKLY;BYDAY=MO\nEXDATE:20260309T100000\nEXDATE:20260316T100000\nEND:VEVENT";
-        let exdates = extract_exdates(ical);
+        let exdates = extract_exdates(ical).unwrap();
         assert_eq!(exdates.len(), 2);
         assert_eq!(exdates[0], dt(2026, 3, 9, 10, 0));
         assert_eq!(exdates[1], dt(2026, 3, 16, 10, 0));
@@ -369,7 +509,7 @@ mod tests {
             DTEND:20260309T150000\n\
             END:VEVENT\n\
             END:VCALENDAR";
-        let exdates = extract_exdates(ical);
+        let exdates = extract_exdates(ical).unwrap();
         // The RECURRENCE-ID should be treated as an exclusion
         assert_eq!(exdates.len(), 1);
         assert_eq!(exdates[0], dt(2026, 3, 9, 10, 0));
@@ -613,9 +753,48 @@ mod tests {
     // --- extract_exdates with multiple formats ---
 
     #[test]
+    fn resource_timezone_aliases_apply_to_exdates_and_recurrence_ids_in_both_seasons() {
+        for field in ["EXDATE", "RECURRENCE-ID"] {
+            let raw = format!("BEGIN:VCALENDAR\nBEGIN:VTIMEZONE\nTZID:Custom-Paris\nX-LIC-LOCATION:Europe/Paris\nEND:VTIMEZONE\nBEGIN:VEVENT\n{field};TZID=Custom-Paris:20260115T100000\n{field};TZID=Custom-Paris:20260715T100000\nEND:VEVENT\nEND:VCALENDAR");
+            assert_eq!(
+                extract_exdates_in_tz(&raw, Some(chrono_tz::UTC)).unwrap(),
+                vec![dt(2026, 1, 15, 9, 0), dt(2026, 7, 15, 8, 0)]
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_exclusion_dates_and_zones_are_explicit_errors() {
+        for (line, code) in [
+            (
+                "EXDATE;TZID=Not/AZone:20260715T100000",
+                "unsupported_timezone",
+            ),
+            ("EXDATE:invalid", "invalid_recurrence"),
+            (
+                "EXDATE;TZID=Europe/Paris:20260329T023000",
+                "invalid_recurrence",
+            ),
+        ] {
+            let error = extract_exdates_in_tz(line, Some(chrono_tz::UTC)).unwrap_err();
+            assert_eq!(crate::sync_diagnostics::error_kind(&error), code);
+        }
+    }
+
+    #[test]
+    fn microsoft_uri_exdate_lists_keep_all_dates_and_the_timezone() {
+        let raw =
+            "EXDATE;TZID=tzone://Microsoft/Olson/Europe/Paris:20260115T100000,20260715T100000";
+        assert_eq!(
+            extract_exdates_in_tz(raw, Some(chrono_tz::UTC)).unwrap(),
+            vec![dt(2026, 1, 15, 9, 0), dt(2026, 7, 15, 8, 0)]
+        );
+    }
+
+    #[test]
     fn test_extract_exdates_with_timezone() {
         let ical = "BEGIN:VEVENT\nDTSTART:20260302T100000\nRRULE:FREQ=WEEKLY\nEXDATE;TZID=Europe/Paris:20260309T100000\nEND:VEVENT";
-        let exdates = extract_exdates(ical);
+        let exdates = extract_exdates(ical).unwrap();
         assert_eq!(exdates.len(), 1);
         assert_eq!(exdates[0], dt(2026, 3, 9, 10, 0));
     }
@@ -624,7 +803,7 @@ mod tests {
     fn test_extract_exdates_comma_separated() {
         let ical =
             "BEGIN:VEVENT\nEXDATE:20260309T100000,20260316T100000,20260323T100000\nEND:VEVENT";
-        let exdates = extract_exdates(ical);
+        let exdates = extract_exdates(ical).unwrap();
         assert_eq!(exdates.len(), 3);
     }
 }

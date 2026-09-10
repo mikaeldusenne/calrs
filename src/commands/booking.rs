@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use std::io::{self, Write};
 
-use crate::utils::{convert_event_to_tz, parse_ical_datetime, prompt};
+use crate::utils::{parse_ical_datetime, prompt};
 
 #[derive(Debug, Subcommand)]
 pub enum BookingCommands {
@@ -207,10 +207,15 @@ pub async fn run(pool: &SqlitePool, key: &[u8; 32], cmd: BookingCommands) -> Res
                     }
                     continue;
                 }
-                let ev_start = parse_ical_datetime(bs)
-                    .map(|dt| convert_event_to_tz(dt, event_tz.as_deref(), host_tz));
-                let ev_end = parse_ical_datetime(be)
-                    .map(|dt| convert_event_to_tz(dt, event_tz.as_deref(), host_tz));
+                let ev_start = parse_ical_datetime(bs).and_then(|dt| {
+                    crate::utils::checked_event_to_tz(dt, event_tz.as_deref(), host_tz)
+                });
+                let ev_end = parse_ical_datetime(be).and_then(|dt| {
+                    crate::utils::checked_event_to_tz(dt, event_tz.as_deref(), host_tz)
+                });
+                if ev_start.is_none() || ev_end.is_none() {
+                    bail!("Calendar event time could not be interpreted");
+                }
                 if let (Some(s), Some(e)) = (ev_start, ev_end) {
                     if s < buf_end && e > buf_start {
                         bail!(

@@ -1360,3 +1360,13 @@ sync-error-snapshot-too-large = Le calendrier dépasse la limite de sécurité d
 sync-error-body = La réponse du serveur n’a pas pu être reçue entièrement.
 sync-error-http-transport = Une erreur de transport HTTP a interrompu la synchronisation.
 sync-error-application = La synchronisation a échoué. Utiliser la référence et la dernière étape pour le diagnostic.
+# Private synchronization failure report
+sync-event-heading = Événement qui n’a pas pu être synchronisé
+sync-event-private = Rapport privé de votre calendrier. Ces détails ne sont pas écrits dans les logs.
+sync-event-title = Titre
+sync-event-untitled = Événement sans titre
+sync-event-start = Début (horaire reçu)
+sync-event-end = Fin (horaire reçu)
+sync-event-timezone = Identifiants de fuseau horaire
+sync-event-occurrence = Occurrence d’origine de la récurrence
+sync-event-uid = Identifiant de l’événement

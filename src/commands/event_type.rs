@@ -7,7 +7,7 @@ use sqlx::SqlitePool;
 use tabled::{Table, Tabled};
 use uuid::Uuid;
 
-use crate::utils::{convert_event_to_tz, parse_ical_datetime};
+use crate::utils::parse_ical_datetime;
 
 #[derive(Debug, Subcommand)]
 pub enum EventTypeCommands {
@@ -254,18 +254,27 @@ pub async fn run(pool: &SqlitePool, cmd: EventTypeCommands) -> Result<()> {
             // Non-recurring events (with timezone for conversion)
             let events = fetch_nonrecurring_busy_events(pool, &et_id, now, window_end_dt).await?;
 
-            let mut busy_events: Vec<(String, String)> = events
+            let busy_events: Option<Vec<(String, String)>> = events
                 .iter()
-                .filter_map(|(s, e, tz)| {
-                    let start =
-                        convert_event_to_tz(parse_ical_datetime(s)?, tz.as_deref(), host_tz);
-                    let end = convert_event_to_tz(parse_ical_datetime(e)?, tz.as_deref(), host_tz);
+                .map(|(s, e, tz)| {
+                    let start = crate::utils::checked_event_to_tz(
+                        parse_ical_datetime(s)?,
+                        tz.as_deref(),
+                        host_tz,
+                    )?;
+                    let end = crate::utils::checked_event_to_tz(
+                        parse_ical_datetime(e)?,
+                        tz.as_deref(),
+                        host_tz,
+                    )?;
                     Some((
                         start.format("%Y-%m-%dT%H:%M:%S").to_string(),
                         end.format("%Y-%m-%dT%H:%M:%S").to_string(),
                     ))
                 })
                 .collect();
+            let mut busy_events = busy_events
+                .ok_or_else(|| anyhow::anyhow!("Calendar event time could not be interpreted"))?;
 
             // Bookings (already in host-local time, no conversion needed)
             let booking_busy: Vec<(String, String)> = sqlx::query_as(
@@ -300,31 +309,13 @@ pub async fn run(pool: &SqlitePool, cmd: EventTypeCommands) -> Result<()> {
             .await
             .unwrap_or_default();
 
-            for (s, e, rrule_str, raw_ical, event_tz) in &recurring {
-                if let (Some(ev_start), Some(ev_end)) =
-                    (parse_ical_datetime(s), parse_ical_datetime(e))
-                {
-                    let exdates = raw_ical
-                        .as_deref()
-                        .map(crate::rrule::extract_exdates)
-                        .unwrap_or_default();
-                    let occurrences = crate::rrule::expand_rrule(
-                        ev_start,
-                        ev_end,
-                        rrule_str,
-                        &exdates,
-                        now,
-                        window_end_dt,
-                    );
-                    for (os, oe) in occurrences {
-                        let cs = convert_event_to_tz(os, event_tz.as_deref(), host_tz);
-                        let ce = convert_event_to_tz(oe, event_tz.as_deref(), host_tz);
-                        busy_events.push((
-                            cs.format("%Y-%m-%dT%H:%M:%S").to_string(),
-                            ce.format("%Y-%m-%dT%H:%M:%S").to_string(),
-                        ));
-                    }
-                }
+            for (start, end) in
+                crate::web::expand_recurring_into_busy(&recurring, now, window_end_dt, host_tz)
+            {
+                busy_events.push((
+                    start.format("%Y-%m-%dT%H:%M:%S").to_string(),
+                    end.format("%Y-%m-%dT%H:%M:%S").to_string(),
+                ));
             }
 
             // Required shared resources: same blocking intervals as the web

@@ -6,6 +6,83 @@ use tracing::{Instrument, Span};
 
 pub(crate) const TARGET: &str = "calrs::sync_diagnostics";
 
+/// Private owner-facing metadata, deliberately excluded from Display/Debug logs.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct EventFailure {
+    pub title: Option<String>,
+    pub start: Option<String>,
+    pub end: Option<String>,
+    pub uid: Option<String>,
+    pub recurrence_id: Option<String>,
+    pub timezones: Vec<String>,
+}
+
+impl EventFailure {
+    pub(crate) fn from_event(event: &str) -> Self {
+        let bounded = |s: String| {
+            s.chars()
+                .filter(|c| !c.is_control())
+                .take(256)
+                .collect::<String>()
+        };
+        let field = |name| crate::utils::extract_vevent_field(event, name).map(bounded);
+        let date = |name| {
+            field(name).map(|s| {
+                crate::utils::parse_ical_datetime(&s)
+                    .map(|d| {
+                        if s.ends_with('Z') {
+                            d.format("%Y-%m-%d %H:%M:%S UTC").to_string()
+                        } else if s.len() == 8 {
+                            d.format("%Y-%m-%d").to_string()
+                        } else {
+                            d.format("%Y-%m-%d %H:%M:%S").to_string()
+                        }
+                    })
+                    .unwrap_or(s)
+            })
+        };
+        let mut timezones = Vec::new();
+        for line in crate::utils::unfold_ical(event).lines() {
+            if let Some(rest) = ["DTSTART", "DTEND", "EXDATE", "RECURRENCE-ID"]
+                .iter()
+                .find_map(|name| line.strip_prefix(name))
+            {
+                if let Some((params, _)) = crate::timezone::params_and_value(rest) {
+                    for (_, value) in params
+                        .into_iter()
+                        .filter(|(key, _)| key.eq_ignore_ascii_case("TZID"))
+                    {
+                        let value = bounded(value);
+                        if timezones.len() < 8 && !timezones.contains(&value) {
+                            timezones.push(value);
+                        }
+                    }
+                }
+            }
+        }
+        Self {
+            title: field("SUMMARY"),
+            start: date("DTSTART"),
+            end: date("DTEND"),
+            uid: field("UID"),
+            recurrence_id: date("RECURRENCE-ID"),
+            timezones,
+        }
+    }
+}
+
+impl std::fmt::Display for EventFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("calendar event validation failed (private details)")
+    }
+}
+impl std::fmt::Debug for EventFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+impl std::error::Error for EventFailure {}
+
 #[derive(Debug)]
 pub(crate) struct SyncFailure {
     pub code: &'static str,

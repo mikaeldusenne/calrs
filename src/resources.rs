@@ -21,10 +21,7 @@ use chrono_tz::Tz;
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
-use crate::utils::{
-    convert_event_to_tz, extract_vevent_field, extract_vevent_tzid, parse_ical_datetime,
-    split_vevents,
-};
+use crate::utils::{extract_vevent_field, extract_vevent_tzid, parse_ical_datetime, split_vevents};
 
 /// Re-sync a resource feed when older than this many minutes.
 pub const SYNC_STALE_MINUTES: i64 = 5;
@@ -438,14 +435,19 @@ pub async fn busy_for_resource(
     .await
     .unwrap_or_default();
 
-    let mut busy: Vec<(NaiveDateTime, NaiveDateTime)> = events
+    let busy: Option<Vec<(NaiveDateTime, NaiveDateTime)>> = events
         .iter()
-        .filter_map(|(s, e, tz)| {
-            let start = convert_event_to_tz(parse_ical_datetime(s)?, tz.as_deref(), host_tz);
-            let end = convert_event_to_tz(parse_ical_datetime(e)?, tz.as_deref(), host_tz);
+        .map(|(s, e, tz)| {
+            let start =
+                crate::utils::checked_event_to_tz(parse_ical_datetime(s)?, tz.as_deref(), host_tz)?;
+            let end =
+                crate::utils::checked_event_to_tz(parse_ical_datetime(e)?, tz.as_deref(), host_tz)?;
             Some((start, end))
         })
         .collect();
+    let Some(mut busy) = busy else {
+        return vec![(window_start, window_end)];
+    };
 
     let recurring: Vec<(String, String, String, Option<String>, Option<String>)> = sqlx::query_as(
         "SELECT start_at, end_at, rrule, raw_ical, timezone FROM resource_events

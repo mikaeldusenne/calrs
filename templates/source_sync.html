@@ -15,6 +15,20 @@
   {% if job.sync_error and not active %}
   <p role="alert">{{ t(error_key) }}{% if job.sync_http_status %} — HTTP {{ job.sync_http_status }}{% endif %} (<code>{{ job.sync_error }}</code>)</p>
   <p>{{ t("sync-failed-note") }}</p>
+  {% if event_error %}
+  <section aria-label="{{ t('sync-event-heading') }}">
+    <h2>{{ t("sync-event-heading") }}</h2>
+    <p>{{ t("sync-event-private") }}</p>
+    <dl>
+      <dt>{{ t("sync-event-title") }}</dt><dd>{{ event_error.title or t("sync-event-untitled") }}</dd>
+      {% if event_error.start %}<dt>{{ t("sync-event-start") }}</dt><dd>{{ event_error.start }}</dd>{% endif %}
+      {% if event_error.end %}<dt>{{ t("sync-event-end") }}</dt><dd>{{ event_error.end }}</dd>{% endif %}
+      {% if event_error.timezones %}<dt>{{ t("sync-event-timezone") }}</dt><dd>{{ event_error.timezones | join(', ') }}</dd>{% endif %}
+      {% if event_error.recurrence_id %}<dt>{{ t("sync-event-occurrence") }}</dt><dd>{{ event_error.recurrence_id }}</dd>{% endif %}
+      {% if event_error.uid %}<dt>{{ t("sync-event-uid") }}</dt><dd><code>{{ event_error.uid }}</code></dd>{% endif %}
+    </dl>
+  </section>
+  {% endif %}
   {% endif %}
   <p>{{ t("sync-last-verified") }} : {{ job.sync_verified_at or t("sync-never") }}{% if job.sync_verified_at %} UTC{% endif %}</p>
   {% if job.needs_setup and job.sync_status == "ok" %}

@@ -272,6 +272,14 @@ pub async fn migrate(pool: &SqlitePool) -> Result<()> {
             "064_sync_jobs",
             include_str!("../migrations/064_sync_jobs.sql"),
         ),
+        (
+            "065_revalidate_timezone_snapshots",
+            include_str!("../migrations/065_revalidate_timezone_snapshots.sql"),
+        ),
+        (
+            "066_private_sync_event_error",
+            include_str!("../migrations/066_private_sync_event_error.sql"),
+        ),
     ];
 
     let mut applied_count = 0u32;
@@ -879,7 +887,7 @@ mod tests {
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(count.0, 64, "All 64 migrations should be tracked");
+        assert_eq!(count.0, 66, "All 66 migrations should be tracked");
     }
 
     #[tokio::test]
@@ -893,7 +901,7 @@ mod tests {
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(count.0, 64, "Still 64 migrations after second run");
+        assert_eq!(count.0, 66, "Still 66 migrations after second run");
     }
 
     #[tokio::test]

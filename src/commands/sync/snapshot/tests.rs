@@ -83,13 +83,24 @@ async fn server(State(mock): State<Arc<Mock>>, request: Request) -> (StatusCode,
             if mode == 3 {
                 multistatus("")
             } else {
-                let etag = if matches!(mode, 1 | 4 | 5) {
+                let etag = if matches!(mode, 1 | 4..=6) {
                     "changed"
                 } else {
                     "v1"
                 };
                 let ical = if mode == 4 {
                     MASTER.replace("DTEND;TZID=Europe/Paris:20000101T100000", "DTEND:invalid")
+                } else if mode == 6 {
+                    MASTER
+                        .replace("Europe/Paris", "Opaque")
+                        .replace(
+                            "VERSION:2.0",
+                            "VERSION:2.0\r\nBEGIN:VTIMEZONE\r\nTZID:Opaque\r\nEND:VTIMEZONE",
+                        )
+                        .replace(
+                            "UID:old-series",
+                            "UID:old-series\r\nSUMMARY:Private calendar event",
+                        )
                 } else {
                     MASTER.into()
                 };
@@ -189,7 +200,7 @@ async fn upstream_or_validation_failure_preserves_entire_snapshot_and_success_ti
         .execute(&pool)
         .await
         .unwrap();
-    for mode in [1, 4] {
+    for mode in [1, 4, 6] {
         mock.mode.store(mode, Ordering::SeqCst);
         let error = sync(&pool, &client, "s", true, 0).await.unwrap_err();
         assert!(!error.to_string().contains("PRIVATE"));
@@ -259,4 +270,250 @@ async fn credential_change_invalidates_cache_and_prevents_old_worker_publication
         2
     );
     server.abort();
+}
+
+async fn stored_calendar(ical: &str) -> Result<SqlitePool, String> {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    crate::db::migrate(&pool).await.unwrap();
+    sqlx::query("INSERT INTO users (id, email, name, role, auth_provider, username) VALUES ('host', 'host@example.test', 'Host', 'user', 'local', 'host')").execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO accounts (id, name, email, user_id) VALUES ('a', 'Test', 'host@example.test', 'host')").execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO caldav_sources (id, account_id, name, url, username) VALUES ('s', 'a', 'Test', 'http://example.test', 'user')").execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO calendars (id, source_id, href) VALUES ('c', 's', '/cal/')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let mut conn = pool.acquire().await.unwrap();
+    store_events(&mut conn, "c", ical)
+        .await
+        .map_err(|e| diagnostics::error_kind(&e).to_string())?;
+    drop(conn);
+    Ok(pool)
+}
+
+async fn stored_timezone(ical: &str) -> Result<Option<String>, String> {
+    let pool = stored_calendar(ical).await?;
+    Ok(
+        sqlx::query_scalar("SELECT timezone FROM events WHERE calendar_id = 'c'")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+    )
+}
+
+#[tokio::test]
+async fn exchange_windows_tzid_is_stored_as_iana() {
+    let ical = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VTIMEZONE\r\nTZID:Romance Standard Time\r\nX-LIC-LOCATION:Europe/Paris\r\nBEGIN:STANDARD\r\nDTSTART:16011028T030000\r\nTZOFFSETFROM:+0200\r\nTZOFFSETTO:+0100\r\nEND:STANDARD\r\nEND:VTIMEZONE\r\nBEGIN:VEVENT\r\nUID:exchange-1\r\nDTSTART;TZID=Romance Standard Time:20260310T100000\r\nDTEND;TZID=Romance Standard Time:20260310T110000\r\nSUMMARY:Staff\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+    assert_eq!(
+        stored_timezone(ical).await.unwrap().as_deref(),
+        Some("Europe/Paris")
+    );
+}
+
+#[tokio::test]
+async fn microsoft_olson_uri_is_stored_as_iana() {
+    let ical = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:ms-1\r\nDTSTART;TZID=\"tzone://Microsoft/Olson/Europe/Paris\":20260310T100000\r\nDTEND;TZID=\"tzone://Microsoft/Olson/Europe/Paris\":20260310T110000\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+    assert_eq!(
+        stored_timezone(ical).await.unwrap().as_deref(),
+        Some("Europe/Paris")
+    );
+}
+
+#[tokio::test]
+async fn vtimezone_without_iana_location_uses_its_actual_offset() {
+    let ical = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VTIMEZONE\r\nTZID:Customized Time Zone\r\nBEGIN:STANDARD\r\nDTSTART:16010101T000000\r\nTZOFFSETFROM:+0100\r\nTZOFFSETTO:+0100\r\nEND:STANDARD\r\nEND:VTIMEZONE\r\nBEGIN:VEVENT\r\nUID:custom-1\r\nDTSTART;TZID=Customized Time Zone:20260310T100000\r\nDTEND;TZID=Customized Time Zone:20260310T110000\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+    for ical in [
+        ical.to_string(),
+        ical.replace(
+            "TZID:Customized Time Zone",
+            "TZID:Customized Time Zone\r\nX-LIC-LOCATION:Europe/Paris",
+        ),
+    ] {
+        let tz = stored_timezone(&ical).await.unwrap();
+        let date = parse_ical_datetime("20260715T100000").unwrap();
+        assert_eq!(
+            crate::utils::checked_event_to_tz(date, tz.as_deref(), "Europe/Paris".parse().unwrap()),
+            Some(parse_ical_datetime("20260715T110000").unwrap())
+        );
+    }
+}
+
+#[tokio::test]
+async fn unknown_tzid_without_vtimezone_still_fails_closed() {
+    let ical = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:bad-1\r\nDTSTART;TZID=Not/AZone:20260310T100000\r\nDTEND;TZID=Not/AZone:20260310T110000\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+    assert_eq!(
+        stored_timezone(ical).await.unwrap_err(),
+        "unsupported_timezone"
+    );
+}
+
+const PARIS_VTIMEZONE: &str = "BEGIN:VTIMEZONE\r\nTZID:Custom-Paris\r\nBEGIN:STANDARD\r\nDTSTART:19701025T030000\r\nRRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=-1SU\r\nTZOFFSETFROM:+0200\r\nTZOFFSETTO:+0100\r\nEND:STANDARD\r\nBEGIN:DAYLIGHT\r\nDTSTART:19700329T020000\r\nRRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=-1SU\r\nTZOFFSETFROM:+0100\r\nTZOFFSETTO:+0200\r\nEND:DAYLIGHT\r\nEND:VTIMEZONE\r\n";
+
+#[tokio::test]
+async fn custom_exdate_excludes_the_correct_occurrence() {
+    let ical = format!("BEGIN:VCALENDAR\r\nVERSION:2.0\r\n{PARIS_VTIMEZONE}BEGIN:VEVENT\r\nUID:exdate\r\nDTSTART:20260715T080000Z\r\nDTEND:20260715T090000Z\r\nRRULE:FREQ=DAILY;BYHOUR=8,10;COUNT=4\r\nEXDATE;TZID=Custom-Paris:20260715T100000\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n");
+    let pool = stored_calendar(&ical).await.unwrap();
+    let rows = sqlx::query_as("SELECT start_at, end_at, rrule, raw_ical, timezone FROM events")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    let busy = crate::web::expand_recurring_into_busy(
+        &rows,
+        parse_ical_datetime("20260715T000000").unwrap(),
+        parse_ical_datetime("20260716T000000").unwrap(),
+        chrono_tz::UTC,
+    );
+    // EXDATE 10:00 Paris excludes 08:00 UTC, NOT the 10:00 UTC meeting.
+    assert_eq!(
+        busy,
+        vec![(
+            parse_ical_datetime("20260715T100000").unwrap(),
+            parse_ical_datetime("20260715T110000").unwrap()
+        )]
+    );
+}
+
+#[tokio::test]
+async fn old_custom_series_keeps_dst_and_moved_occurrences() {
+    let ical = format!("BEGIN:VCALENDAR\r\n{PARIS_VTIMEZONE}BEGIN:VEVENT\r\nUID:old\r\nDTSTART;TZID=Custom-Paris:20000101T100000\r\nDTEND;TZID=Custom-Paris:20000101T110000\r\nRRULE:FREQ=DAILY\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:old\r\nRECURRENCE-ID;TZID=Custom-Paris:20260329T100000\r\nDTSTART;TZID=Custom-Paris:20260329T140000\r\nDTEND;TZID=Custom-Paris:20260329T150000\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n");
+    let pool = stored_calendar(&ical).await.unwrap();
+    // Exercise the actual busy-time query, including the moved occurrence.
+    sqlx::query("UPDATE caldav_sources SET sync_verified_at = datetime('now'), sync_window_start = '20000101T000000Z'")
+        .execute(&pool).await.unwrap();
+    let busy = crate::web::fetch_busy_times_for_user(
+        &pool,
+        "host",
+        parse_ical_datetime("20260328T000000").unwrap(),
+        parse_ical_datetime("20260331T000000").unwrap(),
+        chrono_tz::UTC,
+        None,
+    )
+    .await;
+    let mut actual: Vec<_> = busy
+        .into_iter()
+        .map(|(s, e)| {
+            (
+                s.format("%Y%m%dT%H%M%S").to_string(),
+                e.format("%Y%m%dT%H%M%S").to_string(),
+            )
+        })
+        .collect();
+    actual.sort();
+    assert_eq!(
+        actual,
+        vec![
+            ("20260328T090000".into(), "20260328T100000".into()), // Winter UTC+1.
+            ("20260329T120000".into(), "20260329T130000".into()), // Moved, UTC+2.
+            ("20260330T080000".into(), "20260330T090000".into()), // Summer UTC+2.
+        ]
+    );
+}
+
+#[tokio::test]
+async fn unresolved_end_and_exclusion_zones_fail_snapshot_validation() {
+    for field in ["DTEND", "EXDATE", "RECURRENCE-ID"] {
+        let ical = format!("BEGIN:VCALENDAR\r\nBEGIN:VTIMEZONE\r\nTZID:Opaque\r\nEND:VTIMEZONE\r\nBEGIN:VEVENT\r\nUID:unknown\r\nDTSTART:20260715T080000Z\r\n{field};TZID=Opaque:20260715T100000\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n");
+        assert_eq!(
+            stored_calendar(&ical).await.unwrap_err(),
+            "unsupported_timezone",
+            "{field}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn timezone_upgrade_revalidates_once_without_deleting_cached_events() {
+    let pool = stored_calendar(MASTER).await.unwrap();
+    sqlx::query("UPDATE caldav_sources SET sync_verified_at = datetime('now'), sync_window_start = '20000101T000000Z'")
+        .execute(&pool).await.unwrap();
+    // Simulate a database immediately before migration 065.
+    sqlx::query("DELETE FROM _migrations WHERE name = '065_revalidate_timezone_snapshots'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    crate::db::migrate(&pool).await.unwrap();
+    let state: (Option<String>, i64) =
+        sqlx::query_as("SELECT sync_verified_at, sync_revision FROM caldav_sources WHERE id = 's'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(state, (None, 1));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM events")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        2
+    );
+    assert!(
+        !crate::sync_jobs::available(&pool, "host", None, "20260328T000000Z", "20260331T000000Z")
+            .await
+    );
+    crate::db::migrate(&pool).await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT sync_revision FROM caldav_sources WHERE id = 's'")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn error_report_identifies_the_broken_override_not_the_master() {
+    let pool = stored_calendar(MASTER).await.unwrap();
+    sqlx::query("DELETE FROM events")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let broken = MASTER.replace(
+        "RECURRENCE-ID;TZID=Europe/Paris:20300909T090000",
+        "SUMMARY:Broken override\r\nRECURRENCE-ID;TZID=Unknown-TZ:20300909T090000",
+    );
+    let mut conn = pool.acquire().await.unwrap();
+    let error = store_events(&mut conn, "c", &broken).await.unwrap_err();
+    assert_eq!(diagnostics::error_kind(&error), "unsupported_timezone");
+    let detail = error.downcast_ref::<diagnostics::EventFailure>().unwrap();
+    assert_eq!(detail.title.as_deref(), Some("Broken override"));
+    assert_eq!(detail.recurrence_id.as_deref(), Some("2030-09-09 09:00:00"));
+    assert!(detail.timezones.iter().any(|tz| tz == "Unknown-TZ"));
+}
+
+#[tokio::test]
+async fn custom_timezone_upgrade_keeps_cache_but_requires_revalidation() {
+    let pool = stored_calendar(MASTER).await.unwrap();
+    // Reconstruct the pre-066 schema of this isolated in-memory test database.
+    sqlx::raw_sql(
+        "DROP TRIGGER clear_private_sync_event_error;
+        DROP TRIGGER clear_private_sync_event_error_on_owner_change;
+        ALTER TABLE caldav_sources DROP COLUMN sync_event_error;
+        DELETE FROM _migrations WHERE name = '066_private_sync_event_error';
+        UPDATE caldav_sources SET sync_verified_at = datetime('now');",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    crate::db::migrate(&pool).await.unwrap();
+    let state: (Option<String>, i64, Option<String>) = sqlx::query_as(
+        "SELECT sync_verified_at, sync_revision, sync_event_error FROM caldav_sources WHERE id = 's'")
+        .fetch_one(&pool).await.unwrap();
+    assert_eq!(state, (None, 1, None));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM events")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        2
+    );
+    crate::db::migrate(&pool).await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT sync_revision FROM caldav_sources WHERE id = 's'")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        1
+    );
 }
