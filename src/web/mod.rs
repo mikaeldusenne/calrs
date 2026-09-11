@@ -27825,7 +27825,7 @@ mod tests {
         // The AJAX path must gate on the flag, matching the forward arrow,
         // so a future regression in the payload cannot resurrect the arrow.
         assert!(
-            first_month.contains("if (data.hasPrevMonth && data.prevMonth)"),
+            first_month.contains("if (calData.hasPrevMonth && calData.prevMonth)"),
             "the AJAX back arrow must gate on hasPrevMonth, as the forward arrow does"
         );
     }
