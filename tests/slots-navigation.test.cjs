@@ -76,7 +76,7 @@ function calendar({
   const elements = Object.fromEntries([
     'calendar-data', 'cal-grid', 'slot-panel-title', 'slot-list', 'main-cal-nav',
     'view-toggle', 'slots-layout', 'week-view', 'column-view', 'cal-header-title',
-    'calendar-status', 'calendar-status-text', 'calendar-retry', 'deferred-loader',
+    'calendar-status', 'calendar-status-text', 'calendar-retry', 'calendar-loading',
   ].map(id => [id, new Element()]));
   elements['calendar-data'].textContent = JSON.stringify(initial);
   const requests = [];
@@ -179,12 +179,19 @@ test('failed availability loads are visible and hide stale booking links until r
       await settle();
       assert.match(page.elements['slot-list'].innerHTML, /date=2027-02-01/);
       page.navigateMonth(2027, 3);
+      assert.equal(page.elements['calendar-loading'].classList.contains('is-active'), true);
+      assert.equal(page.elements['calendar-status'].classList.contains('calendar-status-loading'), true);
       await settle();
       assert.match(page.elements['calendar-status-text'].textContent, /failed|unable|could not|error/i);
+      assert.equal(page.elements['calendar-loading'].classList.contains('is-active'), false);
+      assert.equal(page.elements['calendar-status'].classList.contains('calendar-status-loading'), false);
       assert.equal(page.elements['slots-layout'].style.visibility, 'hidden');
       fail = false;
       page.elements['calendar-retry'].click();
+      assert.equal(page.elements['calendar-loading'].classList.contains('is-active'), true);
+      assert.equal(page.elements['calendar-status'].classList.contains('calendar-status-loading'), true);
       await settle();
+      assert.equal(page.elements['calendar-loading'].classList.contains('is-active'), false);
       assert.equal(page.state().monthYear, '2027-03');
       assert.notEqual(page.elements['slots-layout'].style.visibility, 'hidden');
     });
@@ -203,6 +210,23 @@ test('a late response cannot overwrite newer month navigation', async () => {
   await settle();
   assert.equal(page.state().monthYear, '2027-04');
   assert.match(page.elements['cal-header-title'].textContent, /April/);
+});
+
+test('an older request finishing cannot stop the current loading indicator', async () => {
+  const pending = {};
+  const page = calendar({ view: 'month', fetchData: month => new Promise(resolve => { pending[month] = resolve; }) });
+  assert.equal(page.elements['calendar-loading'].classList.contains('is-active'), false);
+  page.navigateMonth(2027, 3);
+  page.navigateMonth(2027, 4);
+  pending['2027-03'](response(monthData('2027-03')));
+  await settle();
+  assert.equal(page.elements['calendar-loading'].classList.contains('is-active'), true);
+  assert.equal(page.elements['slots-layout'].getAttribute('aria-busy'), 'true');
+  pending['2027-04'](response(monthData('2027-04')));
+  await settle();
+  assert.equal(page.elements['calendar-loading'].classList.contains('is-active'), false);
+  assert.equal(page.elements['slots-layout'].getAttribute('aria-busy'), 'false');
+  assert.equal(page.elements['calendar-status'].hidden, true);
 });
 
 test('revisiting a week removes slots no longer returned by the server', async () => {
@@ -285,10 +309,13 @@ test('initial public availability updates automatically when background sync bec
     await settle();
     assert.equal(page.elements['slots-layout'].style.visibility, 'hidden');
     assert.match(page.elements['calendar-status-text'].textContent, /loading/i);
+    assert.equal(page.elements['calendar-status'].classList.contains('calendar-status-loading'), true);
+    assert.equal(page.elements['calendar-loading'].classList.contains('is-active'), true);
     assert.equal(page.timers[0].delay, 2000);
     await page.tick();
     assert.notEqual(page.elements['slots-layout'].style.visibility, 'hidden');
     assert.equal(page.elements['calendar-status'].hidden, true);
+    assert.equal(page.elements['calendar-loading'].classList.contains('is-active'), false);
     assert.equal(page.timers.length, 0);
     const rendered = page.elements[view === 'month' ? 'slot-list' : `${view}-view`].innerHTML;
     if (view === 'column') assert.match(rendered, /No available times/); // A verified empty result is valid.
@@ -302,6 +329,8 @@ test('unavailable calendars show an explicit error and only retry on request', a
   assert.equal(page.elements['slots-layout'].style.visibility, 'hidden');
   assert.match(page.elements['calendar-status-text'].textContent, /could not be verified/i);
   assert.equal(page.elements['calendar-retry'].hidden, false);
+  assert.equal(page.elements['calendar-loading'].classList.contains('is-active'), false);
+  assert.equal(page.elements['calendar-status'].classList.contains('calendar-status-loading'), false);
   assert.equal(page.timers.length, 0);
   assert.equal(page.requests.length, 0);
   page.elements['calendar-retry'].click();

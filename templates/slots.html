@@ -482,6 +482,31 @@
     height: 14px;
     fill: currentColor;
   }
+  .calendar-loading {
+    flex: 0 0 14px;
+    width: 14px;
+    height: 14px;
+    border: 2px solid var(--border);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    visibility: hidden; /* Keep its space even when idle. */
+  }
+  .calendar-loading.is-active {
+    visibility: visible;
+    animation: calrs-spin 0.8s linear infinite;
+  }
+  /* Announce loading without adding a row; errors and retry stay visible. */
+  .calendar-status-loading {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .calendar-loading.is-active { animation: none; }
+  }
 
   /* Week view */
   .week-view {
@@ -866,6 +891,7 @@
             <svg viewBox="0 0 16 16"><rect x="0" y="1" width="16" height="2" rx="0.5"/><rect x="0" y="5" width="16" height="2" rx="0.5"/><rect x="0" y="9" width="16" height="2" rx="0.5"/><rect x="0" y="13" width="16" height="2" rx="0.5"/></svg>
           </button>
         </div>
+        <span id="calendar-loading" class="calendar-loading" aria-hidden="true"></span>
       </div>
       <div class="cal-nav" id="main-cal-nav">
         {% if prev_month is defined and prev_month %}
@@ -907,12 +933,7 @@
           <div class="slot-panel-title" id="slot-panel-title">{{ t("slots-select-date") }}</div>
         </div>
         <div class="slot-list" id="slot-list">
-          {% if deferred_load is defined and deferred_load %}
-          <div class="slot-empty" id="deferred-loader" style="display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 0.75rem; padding: 3rem 1rem;">
-            <div style="width: 24px; height: 24px; border: 3px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: calrs-spin 0.8s linear infinite;"></div>
-            <div style="color: var(--text-muted); font-size: 0.85rem;">{{ t("slots-loading-availability") }}</div>
-          </div>
-          {% else %}
+          {% if deferred_load is not defined or not deferred_load %}
           <div class="slot-empty">
             <div class="slot-empty-icon">&#128197;</div>
             <div>{{ t("slots-click-highlighted") }}</div>
@@ -1192,8 +1213,11 @@
     var replaceHistory = !!initialData;
     var status = document.getElementById('calendar-status');
     var statusText = document.getElementById('calendar-status-text');
+    var loading = document.getElementById('calendar-loading');
     var retry = document.getElementById('calendar-retry');
     var failureText = i18n.loadError || 'Unable to load availability. Please try again.';
+    loading.classList.add('is-active');
+    status.classList.add('calendar-status-loading');
     status.hidden = false;
     statusText.textContent = i18n.loading || 'Loading availability...';
     retry.hidden = true;
@@ -1261,11 +1285,15 @@
     } catch (error) {
       if (requestId !== navigationId) return;
       // Never present a failed request as an empty or still-bookable calendar.
+      status.classList.remove('calendar-status-loading');
       statusText.textContent = failureText;
       retry.hidden = false;
       retry.onclick = function() { navigateCalendar(targetMonth, targetWeek); };
     } finally {
-      if (requestId === navigationId) slotsLayout.setAttribute('aria-busy', 'false');
+      if (requestId === navigationId) {
+        loading.classList.remove('is-active');
+        slotsLayout.setAttribute('aria-busy', 'false');
+      }
     }
   }
 
