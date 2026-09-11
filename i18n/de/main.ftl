@@ -59,6 +59,9 @@ slots-click-highlighted = Klicke auf ein hervorgehobenes Datum, um verfügbare Z
 slots-no-times-month = Keine verfügbaren Zeiten in diesem Monat
 slots-no-times-day = Keine verfügbaren Zeiten an diesem Tag
 slots-no-availability-participants = Keine gemeinsame Verfügbarkeit aller Teilnehmer in diesem Monat
+slots-load-error = Die Verfügbarkeit konnte nicht geladen werden. Bitte versuche es erneut.
+slots-unverified = Die Verfügbarkeit konnte nicht geprüft werden. Bitte versuche es später erneut.
+slots-retry = Erneut versuchen
 slots-week-more = mehr
 
 # Booking form (templates/book.html)
@@ -1371,3 +1374,4 @@ sync-event-end = End (as received)
 sync-event-timezone = Timezone identifiers
 sync-event-occurrence = Original recurrence occurrence
 sync-event-uid = Event identifier
+

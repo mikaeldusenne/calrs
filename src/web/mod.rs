@@ -2,6 +2,7 @@ pub mod captcha;
 pub mod meeting;
 mod source_sync;
 
+use crate::sync_jobs::AvailabilityStatus;
 use crate::utils::{convert_event_to_tz, parse_ical_datetime};
 use axum::extract::{Form, Multipart, Path, Query, State};
 use axum::http::HeaderMap;
@@ -9414,7 +9415,7 @@ async fn show_group_slots(
     let end_date = now_host.date() + Duration::days((start_offset + days_ahead) as i64);
     let window_end = end_date.and_hms_opt(23, 59, 59).unwrap_or(now_host);
 
-    let busy = {
+    let (busy, availability_status) = {
         let tid = &team_id;
         let members: Vec<(String,)> = sqlx::query_as(
             "SELECT u.id FROM users u JOIN team_members tm ON tm.user_id = u.id \
@@ -9436,6 +9437,18 @@ async fn show_group_slots(
             });
         }
         while sync_tasks.join_next().await.is_some() {}
+        let participants: Vec<_> = members
+            .iter()
+            .map(|(uid,)| (uid.as_str(), Some(et_id.as_str())))
+            .collect();
+        let availability_status = calendar_availability_status(
+            &state.pool,
+            &participants,
+            now_host,
+            window_end,
+            host_tz,
+        )
+        .await;
         let mut member_busy = HashMap::new();
         for (uid,) in &members {
             let mut busy = fetch_busy_times_for_user(
@@ -9456,11 +9469,12 @@ async fn show_group_slots(
             busy.extend(user_avail_as_busy(&state.pool, uid, now_host, window_end, host_tz).await);
             member_busy.insert(uid.clone(), busy);
         }
-        if scheduling_mode == "collective" {
+        let busy = if scheduling_mode == "collective" {
             BusySource::Team(member_busy)
         } else {
             BusySource::Group(member_busy)
-        }
+        };
+        (busy, availability_status)
     };
 
     let slot_days = compute_slots(
@@ -9559,6 +9573,7 @@ async fn show_group_slots(
             team_initials => compute_initials(&team_name),
             team_members => team_members_ctx,
             days => days_ctx,
+            availability_status => public_availability_status(availability_status, &slot_days),
             available_dates => available_dates,
             month_label => month_label,
             month_year => month_year,
@@ -10634,7 +10649,7 @@ async fn show_dynamic_group_slots(
     // and render the page shell immediately. JS will fetch with &deferred=1 to get real data.
     let is_deferred_callback = query.deferred.as_deref() == Some("1");
 
-    let slot_days = if is_deferred_callback {
+    let (slot_days, availability_status) = if is_deferred_callback {
         // Full sync + computation (AJAX callback). Safe to parallelize:
         // sync_if_stale holds a per-source mutex and re-checks staleness,
         // so same-source fan-in collapses to one fetch.
@@ -10653,6 +10668,19 @@ async fn show_dynamic_group_slots(
         let end_date = now_host.date() + Duration::days((start_offset + days_ahead) as i64);
         let window_end = end_date.and_hms_opt(23, 59, 59).unwrap_or(now_host);
 
+        let participants: Vec<_> = dg_users
+            .iter()
+            .enumerate()
+            .map(|(i, (uid, _, _, _, _))| (uid.as_str(), (i == 0).then_some(et_id.as_str())))
+            .collect();
+        let availability_status = calendar_availability_status(
+            &state.pool,
+            &participants,
+            now_host,
+            window_end,
+            host_tz,
+        )
+        .await;
         let mut member_busy = HashMap::new();
         for (i, (uid, _, _, _, _)) in dg_users.iter().enumerate() {
             let et_filter = if i == 0 { Some(et_id.as_str()) } else { None };
@@ -10676,7 +10704,7 @@ async fn show_dynamic_group_slots(
         }
         let busy = BusySource::Team(member_busy);
 
-        compute_slots(
+        let slot_days = compute_slots(
             &state.pool,
             &et_id,
             duration,
@@ -10691,10 +10719,11 @@ async fn show_dynamic_group_slots(
             busy,
             None,
         )
-        .await
+        .await;
+        (slot_days, availability_status)
     } else {
         // Initial load: empty slots, page renders instantly
-        vec![]
+        (vec![], AvailabilityStatus::Pending)
     };
 
     let days_ctx: Vec<minijinja::Value> = slot_days
@@ -10748,6 +10777,7 @@ async fn show_dynamic_group_slots(
             }).collect::<Vec<_>>(),
             username => combined_username,
             days => days_ctx,
+            availability_status => public_availability_status(availability_status, &slot_days),
             available_dates => available_dates,
             month_label => month_label,
             month_year => month_year,
@@ -11566,6 +11596,14 @@ async fn show_slots_for_user(
     let now_host = Utc::now().with_timezone(&host_tz).naive_local();
     let end_date = now_host.date() + Duration::days((start_offset + days_ahead) as i64);
     let window_end = end_date.and_hms_opt(23, 59, 59).unwrap_or(now_host);
+    let availability_status = calendar_availability_status(
+        &state.pool,
+        &[(host_user_id.as_str(), Some(et_id.as_str()))],
+        now_host,
+        window_end,
+        host_tz,
+    )
+    .await;
     let busy = BusySource::Individual(
         fetch_busy_times_for_user(
             &state.pool,
@@ -11637,6 +11675,7 @@ async fn show_slots_for_user(
             host_initials => compute_initials(&host_name),
             username => username,
             days => days_ctx,
+            availability_status => public_availability_status(availability_status, &slot_days),
             available_dates => available_dates,
             month_label => month_label,
             month_year => month_year,
@@ -12633,6 +12672,49 @@ pub(crate) fn expand_recurring_into_busy(
         }
     }
     result
+}
+
+/// Readiness for the same participants and date window used by the busy query.
+async fn calendar_availability_status(
+    pool: &SqlitePool,
+    participants: &[(&str, Option<&str>)],
+    window_start: NaiveDateTime,
+    window_end: NaiveDateTime,
+    host_tz: Tz,
+) -> AvailabilityStatus {
+    let Some((start, end)) = host_tz
+        .from_local_datetime(&window_start)
+        .earliest()
+        .zip(host_tz.from_local_datetime(&window_end).latest())
+    else {
+        return AvailabilityStatus::Unavailable;
+    };
+    let start = start.with_timezone(&Utc).format("%Y%m%dT%H%M%SZ").to_string();
+    let end = end.with_timezone(&Utc).format("%Y%m%dT%H%M%SZ").to_string();
+    let mut status = AvailabilityStatus::Ready;
+    for (user_id, event_type_id) in participants {
+        status = status.max(
+            crate::sync_jobs::availability_status_for(
+                pool,
+                user_id,
+                "",
+                *event_type_id,
+                &start,
+                &end,
+            )
+            .await,
+        );
+    }
+    status
+}
+
+/// Keep verified slots usable, including round-robin members with a ready cache.
+fn public_availability_status(status: AvailabilityStatus, days: &[SlotDay]) -> AvailabilityStatus {
+    if days.iter().any(|day| !day.slots.is_empty()) {
+        AvailabilityStatus::Ready
+    } else {
+        status
+    }
 }
 
 /// Fetch busy times for a specific user (events from their calendars + their bookings).
@@ -14137,6 +14219,14 @@ async fn show_slots(
     let now_host = Utc::now().with_timezone(&host_tz).naive_local();
     let end_date = now_host.date() + Duration::days((start_offset + days_ahead) as i64);
     let window_end = end_date.and_hms_opt(23, 59, 59).unwrap_or(now_host);
+    let availability_status = calendar_availability_status(
+        &state.pool,
+        &[(host_user_id.as_str(), Some(et_id.as_str()))],
+        now_host,
+        window_end,
+        host_tz,
+    )
+    .await;
     let busy = BusySource::Individual(
         fetch_busy_times_for_user(
             &state.pool,
@@ -14205,6 +14295,7 @@ async fn show_slots(
             host_has_avatar => host_avatar_path.is_some(),
             host_initials => compute_initials(&host_name),
             days => days_ctx,
+            availability_status => public_availability_status(availability_status, &slot_days),
             available_dates => available_dates,
             month_label => month_label,
             month_year => month_year,
@@ -19746,6 +19837,19 @@ async fn guest_reschedule_slots(
     let now_host = Utc::now().with_timezone(&host_tz).naive_local();
     let end_date = now_host.date() + Duration::days((start_offset + days_ahead) as i64);
     let window_end = end_date.and_hms_opt(23, 59, 59).unwrap_or(now_host);
+    let participants: Vec<_> = hosts
+        .user_ids
+        .iter()
+        .map(|uid| (uid.as_str(), Some(et_id.as_str())))
+        .collect();
+    let availability_status = calendar_availability_status(
+        &state.pool,
+        &participants,
+        now_host,
+        window_end,
+        host_tz,
+    )
+    .await;
     let busy = reschedule_busy_source(
         &state.pool,
         &hosts,
@@ -19838,6 +19942,7 @@ async fn guest_reschedule_slots(
             team_initials => compute_initials(&host.name),
             team_members => team_members_ctx,
             days => days_ctx,
+            availability_status => public_availability_status(availability_status, &slot_days),
             available_dates => available_dates,
             month_label => month_label,
             month_year => month_year,

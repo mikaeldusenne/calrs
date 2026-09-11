@@ -39,6 +39,11 @@ jobs:
             fi
           done < <(find templates -name '*.html' -print0)
           exit $fail
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Check slot navigation without network dependencies
+        run: node --test tests/slots-navigation.test.cjs
 
   check:
     name: Clippy + Tests
