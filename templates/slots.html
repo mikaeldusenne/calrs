@@ -811,6 +811,7 @@
     "nextMonth": "{% if next_month is defined and next_month %}{{ next_month }}{% endif %}",
     "defaultCalendarView": "{{ default_calendar_view | default(value='month') }}",
     "deferredLoad": {% if deferred_load is defined and deferred_load %}true{% else %}false{% endif %},
+    "availabilityStatus": {{ availability_status | default('ready') | tojson }},
     "i18n": {
       "selectDate": {{ t("slots-select-date") | tojson }},
       "noTimesMonth": {{ t("slots-no-times-month") | tojson }},
@@ -818,6 +819,9 @@
       "clickHighlighted": {{ t("slots-click-highlighted") | tojson }},
       "noAvailabilityParticipants": {{ t("slots-no-availability-participants") | tojson }},
       "weekMore": {{ t("slots-week-more") | tojson }},
+      "loading": {{ t("slots-loading-availability") | tojson }},
+      "loadError": {{ t("slots-load-error") | tojson }},
+      "unverified": {{ t("slots-unverified") | tojson }},
       "weekdays": [
         {{ t("slots-weekday-sun") | tojson }},
         {{ t("slots-weekday-mon") | tojson }},
@@ -877,6 +881,10 @@
       </div>
     </div>
 
+    <div id="calendar-status" role="status" hidden>
+      <span id="calendar-status-text"></span>
+      <button type="button" id="calendar-retry" hidden>{{ t("slots-retry") }}</button>
+    </div>
     <div class="slots-layout" id="slots-layout">
       <!-- Month calendar panel -->
       <div class="cal-panel">
@@ -981,6 +989,8 @@
         localStorage.setItem('calrs_time_format', format);
         applyToggleStyle();
         if (selectedDate) selectDay(selectedDate);
+        if (currentView === 'week') buildWeekView();
+        else if (currentView === 'column') buildColumnView();
       });
     });
     applyToggleStyle();
@@ -1000,6 +1010,7 @@
       }
     }
     select.addEventListener('change', function() {
+      params = new URLSearchParams(window.location.search);
       params.set('tz', select.value);
       calrsLoader.show();
       window.location.search = params.toString();
@@ -1090,6 +1101,7 @@
     // Auto-select first available date
     var firstAvail = null;
     for (var key in availableDates) {
+      if (key.slice(0, 7) !== monthYear || key < todayDate) continue;
       if (!firstAvail || key < firstAvail) firstAvail = key;
     }
     if (firstAvail) selectDay(firstAvail);
@@ -1149,111 +1161,117 @@
     listEl.innerHTML = html;
   }
 
-  // AJAX month navigation — only rebuilds calendar + slots, not the full page
+  // All views share one request generation: late responses cannot replace newer data.
   var isDynamicGroup = !!calData.deferredLoad || basePath.indexOf('+') !== -1;
-  function navigateMonth(targetYear, targetMonth) {
-    var monthStr = targetYear + '-' + (targetMonth < 10 ? '0' : '') + targetMonth;
-    var url = basePath + '?month=' + monthStr;
+  var navigationId = 0;
+
+  function calendarUrl(month, week) {
+    var url = basePath + '?month=' + month;
+    if (week) url += '&week=' + dateKey(week);
     if (isDynamicGroup) url += '&deferred=1';
     if (guestTz) url += '&tz=' + encodeURIComponent(guestTz);
     if (inviteToken) url += '&invite=' + encodeURIComponent(inviteToken);
-    url += embedSuffix;
-
-    var layout = document.querySelector('.slots-layout');
-    if (layout) {
-      layout.style.transition = 'opacity 0.15s ease';
-      layout.style.opacity = '0.4';
-    }
-
-    fetch(url).then(function(r) { return r.text(); }).then(function(html) {
-      var parser = new DOMParser();
-      var doc = parser.parseFromString(html, 'text/html');
-      var newDataEl = doc.getElementById('calendar-data');
-      if (!newDataEl) { window.location.href = url; return; }
-
-      var newData = JSON.parse(newDataEl.textContent);
-      slotData = newData.slotData;
-      availableDates = newData.availableDates;
-      firstWeekday = newData.firstWeekday;
-      daysInMonth = newData.daysInMonth;
-      monthYear = newData.monthYear;
-      hasPrevMonth = newData.hasPrevMonth;
-
-      // Keep calData in sync so all views see fresh state
-      calData.monthLabel = newData.monthLabel;
-      calData.prevMonth = newData.prevMonth;
-      calData.nextMonth = newData.nextMonth;
-      calData.hasPrevMonth = newData.hasPrevMonth;
-      calData.hasNextMonth = newData.hasNextMonth;
-
-      // Update month title
-      var titleEl = document.querySelector('.cal-header-title');
-      if (titleEl) titleEl.textContent = newData.monthLabel;
-
-      // Update prev/next nav arrows
-      updateNavArrows(newData);
-
-      // Rebuild calendar grid
-      buildCalendar();
-
-      // Rebuild active alternate view
-      if (currentView === 'week') buildWeekView();
-      else if (currentView === 'column') buildColumnView();
-
-      if (layout) {
-        layout.style.opacity = '1';
-      }
-      if (typeof calrsLoader !== 'undefined') calrsLoader.hide();
-      history.pushState(null, '', url);
-    }).catch(function() {
-      window.location.href = url;
-    });
+    return url + embedSuffix;
   }
 
-  function updateNavArrows(data) {
-    var nav = document.getElementById('main-cal-nav');
-    if (!nav) return;
-    nav.innerHTML = '';
-    if (data.hasPrevMonth && data.prevMonth) {
-      var prevUrl = basePath + '?month=' + data.prevMonth;
-      if (guestTz) prevUrl += '&tz=' + encodeURIComponent(guestTz);
-      if (inviteToken) prevUrl += '&invite=' + encodeURIComponent(inviteToken);
-      prevUrl += embedSuffix;
-      var prev = document.createElement('a');
-      prev.href = prevUrl;
-      prev.innerHTML = '&larr;';
-      prev.addEventListener('click', function(e) {
-        e.preventDefault();
-        var parts = data.prevMonth.split('-');
-        navigateMonth(parseInt(parts[0]), parseInt(parts[1]));
-      });
-      nav.appendChild(prev);
-    } else {
-      var span = document.createElement('span');
-      span.className = 'disabled';
-      span.innerHTML = '&larr;';
-      nav.appendChild(span);
+  async function fetchCalendar(month) {
+    var response = await fetch(calendarUrl(month), { cache: 'no-store' });
+    if (!response.ok) throw new Error('Availability request failed');
+    var doc = new DOMParser().parseFromString(await response.text(), 'text/html');
+    var dataEl = doc.getElementById('calendar-data');
+    if (!dataEl) throw new Error('Availability response missing');
+    var data = JSON.parse(dataEl.textContent);
+    if (data.monthYear !== month || data.deferredLoad || !data.slotData || !data.availableDates) {
+      throw new Error('Availability response incomplete');
     }
-    if (data.hasNextMonth && data.nextMonth) {
-      var nextUrl = basePath + '?month=' + data.nextMonth;
-      if (guestTz) nextUrl += '&tz=' + encodeURIComponent(guestTz);
-      if (inviteToken) nextUrl += '&invite=' + encodeURIComponent(inviteToken);
-      nextUrl += embedSuffix;
-      var next = document.createElement('a');
-      next.href = nextUrl;
-      next.innerHTML = '&rarr;';
-      next.addEventListener('click', function(e) {
-        e.preventDefault();
-        var parts = data.nextMonth.split('-');
-        navigateMonth(parseInt(parts[0]), parseInt(parts[1]));
+    return data;
+  }
+
+  async function navigateCalendar(targetMonth, targetWeek, initialData) {
+    var requestId = ++navigationId;
+    var replaceHistory = !!initialData;
+    var status = document.getElementById('calendar-status');
+    var statusText = document.getElementById('calendar-status-text');
+    var retry = document.getElementById('calendar-retry');
+    var failureText = i18n.loadError || 'Unable to load availability. Please try again.';
+    status.hidden = false;
+    statusText.textContent = i18n.loading || 'Loading availability...';
+    retry.hidden = true;
+    slotsLayout.style.visibility = 'hidden';
+    slotsLayout.setAttribute('aria-busy', 'true');
+
+    // Fetch both months of a split week, even if the previous response included
+    // a few buffered dates from its neighbour. Those dates do not cover a month.
+    var months = [targetMonth];
+    if (targetWeek) {
+      getWeekDates(targetWeek).forEach(function(day) {
+        var month = day.dateStr.slice(0, 7);
+        if (day.dateStr >= todayDate && months.indexOf(month) === -1) months.push(month);
       });
-      nav.appendChild(next);
-    } else {
-      var nspan = document.createElement('span');
-      nspan.className = 'disabled';
-      nspan.innerHTML = '&rarr;';
-      nav.appendChild(nspan);
     }
+    try {
+      // Background sync can temporarily withhold slots. Retry queued/running
+      // work for at most 15 intervals; failures need an explicit user retry.
+      var pages;
+      for (var attempt = 0; ; attempt++) {
+        if (requestId !== navigationId) return;
+        pages = await Promise.all(months.map(function(month) {
+          return initialData && !initialData.deferredLoad && initialData.monthYear === month
+            ? Promise.resolve(initialData) : fetchCalendar(month);
+        }));
+        if (requestId !== navigationId) return;
+        var unverified = pages.some(function(page) {
+          return page.availabilityStatus && page.availabilityStatus !== 'ready';
+        });
+        if (!unverified) break;
+        if (attempt === 15 || pages.some(function(page) { return page.availabilityStatus === 'unavailable'; })) {
+          failureText = i18n.unverified || 'Availability could not be verified. Please try again later.';
+          throw new Error('Availability unverified');
+        }
+        initialData = null;
+        await new Promise(function(resolve) { setTimeout(resolve, 2000); });
+      }
+      if (requestId !== navigationId) return;
+      var previousMonth = monthYear;
+      calData = pages[0];
+      monthYear = calData.monthYear;
+      firstWeekday = calData.firstWeekday;
+      daysInMonth = calData.daysInMonth;
+      hasPrevMonth = calData.hasPrevMonth;
+      todayDate = calData.todayDate;
+      weekStart = targetWeek || (previousMonth === monthYear ? weekStart : initialWeek(monthYear));
+      // Replace rather than merge cached months: removed slots must disappear.
+      slotData = {};
+      availableDates = {};
+      pages.forEach(function(page) {
+        Object.keys(page.slotData).forEach(function(date) {
+          if (date.slice(0, 7) !== page.monthYear) return;
+          slotData[date] = page.slotData[date];
+          if (page.slotData[date].length) availableDates[date] = true;
+        });
+      });
+      buildCalendar();
+      renderView();
+      status.hidden = true;
+      slotsLayout.style.visibility = '';
+      if (typeof calrsLoader !== 'undefined') calrsLoader.hide();
+      var url = calendarUrl(monthYear, targetWeek);
+      if (replaceHistory) history.replaceState(null, '', url);
+      else history.pushState(null, '', url);
+    } catch (error) {
+      if (requestId !== navigationId) return;
+      // Never present a failed request as an empty or still-bookable calendar.
+      statusText.textContent = failureText;
+      retry.hidden = false;
+      retry.onclick = function() { navigateCalendar(targetMonth, targetWeek); };
+    } finally {
+      if (requestId === navigationId) slotsLayout.setAttribute('aria-busy', 'false');
+    }
+  }
+
+  function navigateMonth(targetYear, targetMonth) {
+    var month = targetYear + '-' + String(targetMonth).padStart(2, '0');
+    return navigateCalendar(month, currentView === 'week' ? initialWeek(month) : null);
   }
 
   // Handle browser back/forward
@@ -1301,34 +1319,49 @@
     return href;
   }
 
-  function getWeekDates() {
-    // Get the week containing today (or first available date if today is before this month)
-    var parts = monthYear.split('-');
-    var year = parseInt(parts[0], 10);
-    var month = parseInt(parts[1], 10);
+  function dateKey(date) {
+    return date.getFullYear() + '-' + String(date.getMonth() + 1).padStart(2, '0') +
+      '-' + String(date.getDate()).padStart(2, '0');
+  }
 
-    // Find a good starting date: today if in this month, else first of month
-    var todayParts = todayDate.split('-');
-    var startDate;
-    if (parseInt(todayParts[0]) === year && parseInt(todayParts[1]) === month) {
-      startDate = new Date(year, month - 1, parseInt(todayParts[2]));
-    } else {
-      startDate = new Date(year, month - 1, 1);
+  function addDays(date, days) {
+    var result = new Date(date);
+    result.setDate(result.getDate() + days);
+    return result;
+  }
+
+  function startOfWeek(date) {
+    return addDays(date, -((date.getDay() + 6) % 7));
+  }
+
+  function initialWeek(month) {
+    return startOfWeek(new Date((todayDate.slice(0, 7) === month ? todayDate : month + '-01') + 'T12:00:00'));
+  }
+
+  // The cursor is an absolute local date, independent of the loaded month.
+  var weekStart = initialWeek(monthYear);
+  var savedWeek = new URLSearchParams(window.location.search).get('week');
+  if (savedWeek && /^\d{4}-\d{2}-\d{2}$/.test(savedWeek)) {
+    var savedDate = new Date(savedWeek + 'T12:00:00');
+    if (dateKey(savedDate) === savedWeek && savedDate.getDay() === 1 &&
+        dateKey(addDays(savedDate, 6)) >= todayDate &&
+        getWeekDates(savedDate).some(function(day) { return day.dateStr.slice(0, 7) === monthYear; })) {
+      weekStart = savedDate;
     }
+  }
 
-    // Go back to Monday
-    var dow = startDate.getDay();
-    var mondayOffset = dow === 0 ? -6 : 1 - dow;
-    startDate.setDate(startDate.getDate() + mondayOffset);
+  function getWeekDates(start) {
+    return Array.from({ length: 7 }, function(_, i) {
+      var date = addDays(start || weekStart, i);
+      return { date: date, dateStr: dateKey(date), day: date.getDate(), weekday: shortDays[date.getDay()] };
+    });
+  }
 
-    var dates = [];
-    for (var i = 0; i < 7; i++) {
-      var d = new Date(startDate);
-      d.setDate(startDate.getDate() + i);
-      var ds = d.getFullYear() + '-' + (d.getMonth() < 9 ? '0' : '') + (d.getMonth() + 1) + '-' + (d.getDate() < 10 ? '0' : '') + d.getDate();
-      dates.push({ date: d, dateStr: ds, day: d.getDate(), weekday: shortDays[d.getDay()] });
-    }
-    return dates;
+  function navigateWeek(days) {
+    var target = addDays(weekStart, days);
+    var month = dateKey(target < new Date(todayDate + 'T12:00:00')
+      ? new Date(todayDate + 'T12:00:00') : target).slice(0, 7);
+    return navigateCalendar(month, target);
   }
 
   function buildWeekView() {
@@ -1411,10 +1444,7 @@
       prevBtn.innerHTML = '&larr;';
       prevBtn.addEventListener('click', function(e) {
         e.preventDefault();
-        weekOffset -= 7;
-        var targetDate = new Date(dates[0].date);
-        targetDate.setDate(targetDate.getDate() - 7);
-        ensureMonthLoaded(targetDate, function() { buildWeekView(); });
+        navigateWeek(-7);
       });
       nav.appendChild(prevBtn);
     } else {
@@ -1430,91 +1460,9 @@
     nextBtn.innerHTML = '&rarr;';
     nextBtn.addEventListener('click', function(e) {
       e.preventDefault();
-      weekOffset += 7;
-      var targetDate = new Date(dates[6].date);
-      targetDate.setDate(targetDate.getDate() + 1);
-      ensureMonthLoaded(targetDate, function() { buildWeekView(); });
+      navigateWeek(7);
     });
     nav.appendChild(nextBtn);
-  }
-
-  var weekOffset = 0;
-
-  // Override getWeekDates to use offset
-  getWeekDates = function() {
-    var parts = monthYear.split('-');
-    var year = parseInt(parts[0], 10);
-    var month = parseInt(parts[1], 10);
-
-    var todayParts = todayDate.split('-');
-    var startDate;
-    if (parseInt(todayParts[0]) === year && parseInt(todayParts[1]) === month) {
-      startDate = new Date(year, month - 1, parseInt(todayParts[2]));
-    } else {
-      startDate = new Date(year, month - 1, 1);
-    }
-
-    // Go to Monday of that week
-    var dow = startDate.getDay();
-    var mondayOffset = dow === 0 ? -6 : 1 - dow;
-    startDate.setDate(startDate.getDate() + mondayOffset + weekOffset);
-
-    var dates = [];
-    for (var i = 0; i < 7; i++) {
-      var d = new Date(startDate);
-      d.setDate(startDate.getDate() + i);
-      var ds = d.getFullYear() + '-' + (d.getMonth() < 9 ? '0' : '') + (d.getMonth() + 1) + '-' + (d.getDate() < 10 ? '0' : '') + d.getDate();
-      dates.push({ date: d, dateStr: ds, day: d.getDate(), weekday: shortDays[d.getDay()] });
-    }
-    return dates;
-  };
-
-  // Ensure data is loaded for the month containing targetDate
-  function ensureMonthLoaded(targetDate, cb) {
-    var targetMonth = targetDate.getFullYear() + '-' + (targetDate.getMonth() < 9 ? '0' : '') + (targetDate.getMonth() + 1);
-    if (targetMonth === monthYear) {
-      cb();
-      return;
-    }
-    // Fetch the new month data
-    var url = basePath + '?month=' + targetMonth;
-    if (guestTz) url += '&tz=' + encodeURIComponent(guestTz);
-    if (inviteToken) url += '&invite=' + encodeURIComponent(inviteToken);
-    url += embedSuffix;
-
-    fetch(url).then(function(r) { return r.text(); }).then(function(html) {
-      var parser = new DOMParser();
-      var doc = parser.parseFromString(html, 'text/html');
-      var newDataEl = doc.getElementById('calendar-data');
-      if (!newDataEl) { cb(); return; }
-
-      var newData = JSON.parse(newDataEl.textContent);
-      // Merge slot data (keep existing months, add new)
-      for (var key in newData.slotData) {
-        slotData[key] = newData.slotData[key];
-      }
-      for (var key in newData.availableDates) {
-        availableDates[key] = newData.availableDates[key];
-      }
-      // Update month-specific state
-      monthYear = newData.monthYear;
-      firstWeekday = newData.firstWeekday;
-      daysInMonth = newData.daysInMonth;
-      hasPrevMonth = newData.hasPrevMonth;
-      calData.monthLabel = newData.monthLabel;
-      calData.prevMonth = newData.prevMonth;
-      calData.nextMonth = newData.nextMonth;
-      calData.hasPrevMonth = newData.hasPrevMonth;
-      calData.hasNextMonth = newData.hasNextMonth;
-
-      // Update month title
-      var titleEl = document.querySelector('.cal-header-title');
-      if (titleEl) titleEl.textContent = newData.monthLabel;
-      updateNavArrows(newData);
-      buildCalendar();
-
-      cb();
-    }).catch(function() { cb(); });
   }
 
   function buildColumnView() {
@@ -1607,6 +1555,11 @@
     currentView = view;
     localStorage.setItem('calrs_calendar_view', view);
 
+    return navigateCalendar(monthYear, view === 'week' ? weekStart : null);
+  }
+
+  function renderView() {
+    var view = currentView;
     // Update toggle buttons
     viewToggle.querySelectorAll('button').forEach(function(b) {
       b.classList.toggle('active', b.dataset.view === view);
@@ -1646,55 +1599,11 @@
     });
   }
 
-  // Apply saved view preference
-  if (currentView !== 'month') {
-    switchView(currentView);
-  }
-
-  // --- Deferred slot loading for dynamic group links ---
-  if (calData.deferredLoad) {
-    var deferUrl = basePath + '?deferred=1';
-    if (calData.monthYear) deferUrl += '&month=' + calData.monthYear;
-    if (guestTz) deferUrl += '&tz=' + encodeURIComponent(guestTz);
-    if (inviteToken) deferUrl += '&invite=' + encodeURIComponent(inviteToken);
-    deferUrl += embedSuffix;
-
-    fetch(deferUrl).then(function(r) { return r.text(); }).then(function(html) {
-      var parser = new DOMParser();
-      var doc = parser.parseFromString(html, 'text/html');
-      var newDataEl = doc.getElementById('calendar-data');
-      if (!newDataEl) throw new Error('calendar-data block not found in response');
-
-      var newData = JSON.parse(newDataEl.textContent);
-      slotData = newData.slotData;
-      availableDates = newData.availableDates;
-
-      calData.slotData = slotData;
-      calData.availableDates = availableDates;
-
-      // Update loading spinner with appropriate message
-      var loader = document.getElementById('deferred-loader');
-      if (loader) {
-        var hasSlots = Object.keys(availableDates).length > 0;
-        if (hasSlots) {
-          loader.innerHTML = '<div class="slot-empty-icon">&#128197;</div><div>' + (i18n.clickHighlighted || 'Click a highlighted date to see available times') + '</div>';
-        } else {
-          loader.innerHTML = '<div class="slot-empty-icon">&#128683;</div><div>' + (i18n.noAvailabilityParticipants || 'No availability found for all participants this month') + '</div>';
-        }
-        loader.id = '';
-      }
-
-      // Rebuild all views with real data
-      buildCalendar();
-      if (currentView === 'week') buildWeekView();
-      else if (currentView === 'column') buildColumnView();
-    }).catch(function(e) {
-      console.error('calrs: deferred slot load failed', e);
-      var loader = document.getElementById('deferred-loader');
-      if (loader) {
-        loader.innerHTML = '<div style="color:var(--error-text);">Failed to load availability. Please refresh the page.</div>';
-      }
-    });
+  // Initial data can seed this request; deferred groups still need real data.
+  renderView();
+  if (currentView === 'week' || calData.deferredLoad ||
+      (calData.availabilityStatus && calData.availabilityStatus !== 'ready')) {
+    navigateCalendar(monthYear, currentView === 'week' ? weekStart : null, calData);
   }
 
 })();

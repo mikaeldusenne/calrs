@@ -59,6 +59,9 @@ slots-click-highlighted = Vabade aegade nägemiseks klõpsa esile tõstetud kuup
 slots-no-times-month = Sel kuul pole vabu aegu
 slots-no-times-day = Sel päeval pole vabu aegu
 slots-no-availability-participants = Sel kuul ei leidunud aega, mis sobiks kõigile osalejatele
+slots-load-error = Saadavust ei saanud laadida. Palun proovi uuesti.
+slots-unverified = Saadavust ei saanud kontrollida. Palun proovi hiljem uuesti.
+slots-retry = Proovi uuesti
 slots-week-more = veel
 
 # Booking form (templates/book.html)
@@ -1371,3 +1374,4 @@ sync-event-end = End (as received)
 sync-event-timezone = Timezone identifiers
 sync-event-occurrence = Original recurrence occurrence
 sync-event-uid = Event identifier
+

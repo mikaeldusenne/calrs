@@ -59,6 +59,9 @@ slots-click-highlighted = Cliquez sur une date en surbrillance pour voir les cr�
 slots-no-times-month = Aucun créneau disponible ce mois-ci
 slots-no-times-day = Aucun créneau disponible ce jour
 slots-no-availability-participants = Aucune disponibilité commune trouvée pour tous les participants ce mois-ci
+slots-load-error = Impossible de charger les disponibilités. Veuillez réessayer.
+slots-unverified = Les disponibilités n’ont pas pu être vérifiées. Veuillez réessayer plus tard.
+slots-retry = Réessayer
 slots-week-more = autres
 
 # Booking form (templates/book.html)

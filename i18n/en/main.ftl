@@ -59,6 +59,9 @@ slots-click-highlighted = Click a highlighted date to see available times
 slots-no-times-month = No available times this month
 slots-no-times-day = No available times this day
 slots-no-availability-participants = No availability found for all participants this month
+slots-load-error = Unable to load availability. Please try again.
+slots-unverified = Availability could not be verified. Please try again later.
+slots-retry = Retry
 slots-week-more = more
 
 # Booking form (templates/book.html)

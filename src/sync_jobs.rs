@@ -149,6 +149,15 @@ pub(crate) async fn available(
     .await
 }
 
+/// Public readiness only; never expose source IDs or provider errors to guests.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum AvailabilityStatus {
+    Ready,
+    Pending,
+    Unavailable,
+}
+
 pub(crate) async fn available_for(
     pool: &SqlitePool,
     user_id: &str,
@@ -157,8 +166,29 @@ pub(crate) async fn available_for(
     window_start_utc: &str,
     window_end_utc: &str,
 ) -> bool {
-    let result: Result<i64, _> = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM caldav_sources cs JOIN accounts a ON a.id = cs.account_id
+    availability_status_for(
+        pool,
+        user_id,
+        account_id,
+        event_type_id,
+        window_start_utc,
+        window_end_utc,
+    )
+    .await
+        == AvailabilityStatus::Ready
+}
+
+pub(crate) async fn availability_status_for(
+    pool: &SqlitePool,
+    user_id: &str,
+    account_id: &str,
+    event_type_id: Option<&str>,
+    window_start_utc: &str,
+    window_end_utc: &str,
+) -> AvailabilityStatus {
+    let result: Result<(i64, i64), _> = sqlx::query_as(
+        "SELECT COUNT(*), COUNT(CASE WHEN cs.sync_status IN ('queued', 'running') THEN 1 END)
+         FROM caldav_sources cs JOIN accounts a ON a.id = cs.account_id
          WHERE (a.user_id = ? OR a.id = ?) AND cs.enabled = 1
            AND (EXISTS (SELECT 1 FROM calendars c WHERE c.source_id = cs.id AND c.is_busy = 1
                   AND (NOT EXISTS (SELECT 1 FROM event_type_calendars WHERE event_type_id = ?)
@@ -170,7 +200,11 @@ pub(crate) async fn available_for(
                 OR (cs.sync_window_end IS NOT NULL AND cs.sync_window_end < ?))"
     ).bind(user_id).bind(account_id).bind(event_type_id.unwrap_or("")).bind(event_type_id.unwrap_or(""))
         .bind(event_type_id.unwrap_or("")).bind(window_start_utc).bind(window_end_utc).fetch_one(pool).await;
-    matches!(result, Ok(0))
+    match result {
+        Ok((0, _)) => AvailabilityStatus::Ready,
+        Ok((blocked, pending)) if blocked == pending => AvailabilityStatus::Pending,
+        _ => AvailabilityStatus::Unavailable,
+    }
 }
 
 #[cfg(test)]
@@ -301,7 +335,27 @@ mod tests {
     async fn unknown_stale_failed_and_out_of_coverage_are_not_free() {
         let (pool, _, _, server) = fixture().await;
         let check = || available(&pool, "host", None, "20300101T000000Z", "20300102T000000Z");
+        let status = || {
+            availability_status_for(
+                &pool,
+                "host",
+                "",
+                None,
+                "20300101T000000Z",
+                "20300102T000000Z",
+            )
+        };
         assert!(!check().await); // Including new sources with no discovered calendars.
+        assert_eq!(status().await, AvailabilityStatus::Unavailable);
+        for state in ["queued", "running"] {
+            sqlx::query("UPDATE caldav_sources SET sync_status = ?")
+                .bind(state)
+                .execute(&pool)
+                .await
+                .unwrap();
+            assert_eq!(status().await, AvailabilityStatus::Pending);
+            assert!(!check().await); // Loading never makes an unverified cache bookable.
+        }
         sqlx::query("UPDATE caldav_sources SET sync_verified_at = datetime('now'), sync_window_start = '20200101T000000Z'").execute(&pool).await.unwrap();
         assert!(check().await);
         sqlx::query("UPDATE caldav_sources SET sync_status = 'running'")
@@ -309,6 +363,7 @@ mod tests {
             .await
             .unwrap();
         assert!(check().await); // A fresh complete cache is usable while refreshing.
+        assert_eq!(status().await, AvailabilityStatus::Ready);
         for update in [
             "sync_status = 'failed'",
             "sync_verified_at = '2000-01-01 00:00:00'",
@@ -321,6 +376,12 @@ mod tests {
                 .await
                 .unwrap();
             assert!(!check().await);
+            let expected = if update.contains("'queued'") {
+                AvailabilityStatus::Pending
+            } else {
+                AvailabilityStatus::Unavailable
+            };
+            assert_eq!(status().await, expected);
             sqlx::query("UPDATE caldav_sources SET sync_status = 'ok', sync_error = NULL, sync_verified_at = datetime('now'),
                 sync_window_start = '20200101T000000Z', sync_window_end = NULL").execute(&pool).await.unwrap();
         }
