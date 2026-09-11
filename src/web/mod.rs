@@ -9441,14 +9441,9 @@ async fn show_group_slots(
             .iter()
             .map(|(uid,)| (uid.as_str(), Some(et_id.as_str())))
             .collect();
-        let availability_status = calendar_availability_status(
-            &state.pool,
-            &participants,
-            now_host,
-            window_end,
-            host_tz,
-        )
-        .await;
+        let availability_status =
+            calendar_availability_status(&state.pool, &participants, now_host, window_end, host_tz)
+                .await;
         let mut member_busy = HashMap::new();
         for (uid,) in &members {
             let mut busy = fetch_busy_times_for_user(
@@ -10673,14 +10668,9 @@ async fn show_dynamic_group_slots(
             .enumerate()
             .map(|(i, (uid, _, _, _, _))| (uid.as_str(), (i == 0).then_some(et_id.as_str())))
             .collect();
-        let availability_status = calendar_availability_status(
-            &state.pool,
-            &participants,
-            now_host,
-            window_end,
-            host_tz,
-        )
-        .await;
+        let availability_status =
+            calendar_availability_status(&state.pool, &participants, now_host, window_end, host_tz)
+                .await;
         let mut member_busy = HashMap::new();
         for (i, (uid, _, _, _, _)) in dg_users.iter().enumerate() {
             let et_filter = if i == 0 { Some(et_id.as_str()) } else { None };
@@ -12689,7 +12679,10 @@ async fn calendar_availability_status(
     else {
         return AvailabilityStatus::Unavailable;
     };
-    let start = start.with_timezone(&Utc).format("%Y%m%dT%H%M%SZ").to_string();
+    let start = start
+        .with_timezone(&Utc)
+        .format("%Y%m%dT%H%M%SZ")
+        .to_string();
     let end = end.with_timezone(&Utc).format("%Y%m%dT%H%M%SZ").to_string();
     let mut status = AvailabilityStatus::Ready;
     for (user_id, event_type_id) in participants {
@@ -19842,14 +19835,9 @@ async fn guest_reschedule_slots(
         .iter()
         .map(|uid| (uid.as_str(), Some(et_id.as_str())))
         .collect();
-    let availability_status = calendar_availability_status(
-        &state.pool,
-        &participants,
-        now_host,
-        window_end,
-        host_tz,
-    )
-    .await;
+    let availability_status =
+        calendar_availability_status(&state.pool, &participants, now_host, window_end, host_tz)
+            .await;
     let busy = reschedule_busy_source(
         &state.pool,
         &hosts,
