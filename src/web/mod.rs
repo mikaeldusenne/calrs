@@ -386,7 +386,7 @@ async fn resolve_booking_location(
         .filter(|s| !s.is_empty())
 }
 
-/// Background task that sends booking reminders on a 60-second tick. Also
+/// Background task that refreshes calendars and sends reminders every 60 seconds. Also
 /// piggybacks an hourly sweep of expired sessions so the `sessions` table
 /// doesn't accumulate dead rows indefinitely.
 pub async fn run_reminder_loop(pool: SqlitePool, secret_key: [u8; 32]) {
@@ -404,6 +404,28 @@ pub async fn run_reminder_loop(pool: SqlitePool, secret_key: [u8; 32]) {
                 Err(e) => tracing::warn!(error = %e, "session cleanup failed"),
             }
             last_session_cleanup = std::time::Instant::now();
+        }
+
+        // Refresh before the five-minute safety threshold, independently of
+        // reminder delivery (including all reminder-specific early exits below).
+        let _ = crate::sync_jobs::expire(&pool).await;
+        let stale: Vec<String> = sqlx::query_scalar(
+            "SELECT cs.id
+             FROM caldav_sources cs
+             WHERE cs.enabled = 1
+               AND cs.sync_status NOT IN ('queued', 'running')
+               AND (cs.sync_finished_at IS NULL OR cs.sync_finished_at < datetime('now', '-60 seconds'))
+               AND (cs.sync_verified_at IS NULL OR cs.sync_verified_at < datetime('now', '-180 seconds') OR cs.sync_status = 'failed')
+             ORDER BY COALESCE(cs.sync_finished_at, '2000-01-01') ASC
+             LIMIT 2",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap_or_default();
+
+        for source_id in stale {
+            let _ = crate::sync_jobs::enqueue(&pool, &secret_key, &source_id, false, "background")
+                .await;
         }
 
         // Find bookings that need a reminder:
@@ -576,28 +598,6 @@ pub async fn run_reminder_loop(pool: SqlitePool, secret_key: [u8; 32]) {
                     .await;
 
             tracing::info!(booking_id = %bid, "reminder sent");
-        }
-
-        // Refresh before the five-minute safety threshold; enqueue without
-        // delaying reminders or letting one failing source starve the others.
-        let _ = crate::sync_jobs::expire(&pool).await;
-        let stale: Vec<String> = sqlx::query_scalar(
-            "SELECT cs.id
-             FROM caldav_sources cs
-             WHERE cs.enabled = 1
-               AND cs.sync_status NOT IN ('queued', 'running')
-               AND (cs.sync_finished_at IS NULL OR cs.sync_finished_at < datetime('now', '-60 seconds'))
-               AND (cs.sync_verified_at IS NULL OR cs.sync_verified_at < datetime('now', '-180 seconds') OR cs.sync_status = 'failed')
-             ORDER BY COALESCE(cs.sync_finished_at, '2000-01-01') ASC
-             LIMIT 2",
-        )
-        .fetch_all(&pool)
-        .await
-        .unwrap_or_default();
-
-        for source_id in stale {
-            let _ = crate::sync_jobs::enqueue(&pool, &secret_key, &source_id, false, "background")
-                .await;
         }
     }
 }
@@ -29573,6 +29573,79 @@ mod tests {
     }
 
     // --- Dashboard pages: new event type form ---
+
+    #[tokio::test]
+    async fn background_refresh_without_reminders_keeps_availability_fresh() {
+        use tokio::time::{advance, pause, resume, sleep, timeout, Duration as StdDuration};
+
+        // Both refresh before expiry and recover after the five-minute limit.
+        for age_minutes in [4, 6] {
+            let (pool, _, mock, server) = crate::commands::sync::snapshot::tests::fixture().await;
+            crate::commands::sync::sync_source_by_id(&pool, &[0; 32], "s", false)
+                .await
+                .unwrap();
+            let age = format!("-{age_minutes} minutes");
+            sqlx::query(
+                "UPDATE caldav_sources SET sync_verified_at = datetime('now', ?),
+                sync_finished_at = datetime('now', ?), sync_status = 'ok'",
+            )
+            .bind(&age)
+            .bind(&age)
+            .execute(&pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                crate::sync_jobs::available(
+                    &pool,
+                    "host",
+                    None,
+                    "20300101T000000Z",
+                    "20310101T000000Z"
+                )
+                .await,
+                age_minutes < 5
+            );
+            mock.requests.lock().unwrap().clear();
+            // Advance only the loop's timer, then use real time for DB/network I/O.
+            pause();
+            let worker = tokio::spawn(run_reminder_loop(pool.clone(), [0; 32]));
+            tokio::task::yield_now().await;
+            advance(StdDuration::from_secs(60)).await;
+            resume();
+            let refreshed = timeout(StdDuration::from_secs(10), async {
+                loop {
+                    let fresh: bool = sqlx::query_scalar("SELECT sync_status = 'ok'
+                        AND sync_verified_at > datetime('now', '-60 seconds') FROM caldav_sources WHERE id = 's'")
+                        .fetch_one(&pool).await.unwrap();
+                    if fresh { break; }
+                    sleep(StdDuration::from_millis(10)).await;
+                }
+            }).await;
+            worker.abort();
+            server.abort();
+            assert!(
+                refreshed.is_ok(),
+                "calendar refresh was skipped (age: {age_minutes} minutes)"
+            );
+            assert!(
+                crate::sync_jobs::available(
+                    &pool,
+                    "host",
+                    None,
+                    "20300101T000000Z",
+                    "20310101T000000Z"
+                )
+                .await
+            );
+            // Unchanged calendars need only a ctag check, not another download.
+            assert!(!mock
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|body| body.contains("calendar-multiget")));
+        }
+    }
 
     #[tokio::test]
     async fn sync_http_returns_immediately_deduplicates_and_protects_status() {
